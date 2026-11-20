@@ -437,6 +437,43 @@ docker compose logs -f web
 
 После рестарта: если на бирже была позиция — flatten сразу; следующее решение только на границе окна.
 
+### Полный сброс данных + обновление кода (VPS)
+
+Стирает SQLite, логи, кривую истории окон. **Не** трогает `.env` и ключи. Позицию на Lighter бот при старте всё равно flatten.
+
+```bash
+cd /opt/poly-lighter
+
+# 1) остановить
+docker compose down
+
+# 2) бэкап на всякий
+mkdir -p backups
+tar czf "backups/data-$(date -u +%Y%m%dT%H%M%SZ).tgz" data .env
+ls -lh backups | tail
+
+# 3) код
+git fetch origin
+git checkout main
+git pull --ff-only
+git log -1 --oneline
+
+# 4) стереть данные бота (не .env)
+rm -rf data
+mkdir -p data
+
+# 5) собрать и поднять
+docker compose up -d --build --force-recreate bot web
+docker compose ps
+docker compose logs -f --tail=80 bot
+```
+
+Дашборд :8081 — вкладки **Часы** (UTC/Binance vs исполнение Lighter) и широкая таблица окон. Telegram `/status` показывает `clock_binance`.
+
+`sync-clock-http.timer` должен быть **disabled**. Chrony: `Leap status: Normal`. Helper не включать.
+
+---
+
 Стоп-кран сам: 3 окна `exit_late` / unfilled подряд; позиция > 6 мин; equity −8% от пика. Снимается `/resume`.
 
 ---
@@ -484,7 +521,7 @@ npm run dev
 | Порт занят / web не мапится | Donchian на 80; этот бот только 8081; не `--profile tls` рядом с Caddy Donchian |
 | Telegram `409 Conflict` | тот же token, что у Donchian, или второй контейнер |
 | Дашборд 401 после HTTPS | `COOKIE_SECURE=true`, заход по `https://` |
-| Вечный skip `clock` | NTP, offset > 1s |
+| Вечный skip `clock` | вкладка **Часы**: offset Binance−host и RTT. Хост: `chronyc tracking` (не helper `date -s`). RTT > 800 ms — не часы, сеть. Lighter тут ни при чём |
 | skip `no_market` | slug `btc-updown-5m-{ts}`, Gamma 404 — окно без рынка, не подставлять соседнее |
 | skip `below_th` | **норма**, большинство окон |
 | `sendTx` / nonce | второй процесс с тем же api_key_index; один бот на ключ |

@@ -3,9 +3,13 @@ package clock
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 )
+
+// MaxTrustedRTT: a 5s API hang produces a fake multi-second offset via midpoint.
+const MaxTrustedRTT = 800 * time.Millisecond
 
 const WindowSec int64 = 300
 
@@ -85,31 +89,84 @@ type errString string
 
 func (e errString) Error() string { return string(e) }
 
-func MeasureBinanceOffset(ctx context.Context, client *http.Client, baseURL string) (time.Duration, error) {
+type OffsetSample struct {
+	Offset time.Duration
+	RTT    time.Duration
+}
+
+func (s OffsetSample) Trusted() bool {
+	return s.RTT > 0 && s.RTT <= MaxTrustedRTT
+}
+
+func defaultClockHTTP() *http.Client {
+	return &http.Client{Timeout: 1200 * time.Millisecond}
+}
+
+func MeasureBinanceOffset(ctx context.Context, client *http.Client, baseURL string) (OffsetSample, error) {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultClockHTTP()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v3/time", nil)
 	if err != nil {
-		return 0, err
+		return OffsetSample{}, err
 	}
 	t0 := time.Now()
 	resp, err := client.Do(req)
 	t1 := time.Now()
+	rtt := t1.Sub(t0)
 	if err != nil {
-		return 0, err
+		return OffsetSample{RTT: rtt}, err
 	}
 	defer resp.Body.Close()
 	var buf [128]byte
 	n, _ := resp.Body.Read(buf[:])
 	ms, err := parseServerTimeMS(string(buf[:n]))
 	if err != nil {
-		off, err2 := OffsetFromHTTPDate(resp.Header.Get("Date"), t0.Add(t1.Sub(t0)/2))
-		return off, err2
+		off, err2 := OffsetFromHTTPDate(resp.Header.Get("Date"), t0.Add(rtt/2))
+		return OffsetSample{Offset: off, RTT: rtt}, err2
 	}
-	mid := t0.Add(t1.Sub(t0) / 2)
+	mid := t0.Add(rtt / 2)
 	server := time.UnixMilli(ms)
-	return server.Sub(mid), nil
+	return OffsetSample{Offset: server.Sub(mid), RTT: rtt}, nil
+}
+
+func MedianTrustedOffset(samples []OffsetSample) (OffsetSample, bool) {
+	var good []OffsetSample
+	for _, s := range samples {
+		if s.Trusted() {
+			good = append(good, s)
+		}
+	}
+	if len(good) == 0 {
+		return OffsetSample{}, false
+	}
+	sort.Slice(good, func(i, j int) bool { return good[i].Offset < good[j].Offset })
+	return good[len(good)/2], true
+}
+
+// MeasureBinanceOffsetStable takes n probes and returns the median of those with RTT ≤ MaxTrustedRTT.
+func MeasureBinanceOffsetStable(ctx context.Context, client *http.Client, baseURL string, n int) (OffsetSample, error) {
+	if n < 1 {
+		n = 1
+	}
+	samples := make([]OffsetSample, 0, n)
+	var last error
+	for i := 0; i < n; i++ {
+		s, err := MeasureBinanceOffset(ctx, client, baseURL)
+		if err != nil {
+			last = err
+			continue
+		}
+		samples = append(samples, s)
+	}
+	med, ok := MedianTrustedOffset(samples)
+	if !ok {
+		if last != nil {
+			return OffsetSample{}, last
+		}
+		return OffsetSample{}, errString("binance time RTT untrusted")
+	}
+	return med, nil
 }
 
 func parseServerTimeMS(s string) (int64, error) {

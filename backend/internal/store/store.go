@@ -106,7 +106,19 @@ CREATE TABLE IF NOT EXISTS bot_state (
   updated_at INTEGER NOT NULL
 );
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	for _, q := range []string{
+		`ALTER TABLE windows ADD COLUMN stop_px REAL`,
+		`ALTER TABLE windows ADD COLUMN exit_reason TEXT`,
+		`ALTER TABLE windows ADD COLUMN sl_slip_bps REAL`,
+		`ALTER TABLE windows ADD COLUMN clock_offset_ms REAL`,
+		`ALTER TABLE windows ADD COLUMN clock_rtt_ms REAL`,
+	} {
+		_, _ = s.DB.Exec(q)
+	}
+	return nil
 }
 
 type Window struct {
@@ -136,6 +148,11 @@ type Window struct {
 	ShadowRetBps      sql.NullFloat64 `json:"shadow_ret_bps"`
 	PMFav             sql.NullFloat64 `json:"pm_fav"`
 	State             string          `json:"state"`
+	StopPx            sql.NullFloat64 `json:"stop_px"`
+	ExitReason        string          `json:"exit_reason"`
+	SLSlipBps         sql.NullFloat64 `json:"sl_slip_bps"`
+	ClockOffsetMS     sql.NullFloat64 `json:"clock_offset_ms"`
+	ClockRTTMS        sql.NullFloat64 `json:"clock_rtt_ms"`
 }
 
 func nullF(v float64, valid bool) any {
@@ -151,8 +168,9 @@ INSERT INTO windows(
   window_ts, decision_ts, quote_ts, p_up, p_down, spread, quote_source, side, skip_reason,
   lighter_entry_ts, lighter_entry_px, lighter_exit_ts, lighter_exit_px,
   qty, notional, equity_before, equity_after, pnl_usd, ret_bps, fees_usd,
-  entry_lag_ms, fill_lag_ms, shadow_binance_px_t1, shadow_ret_bps, pm_fav, state
-) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  entry_lag_ms, fill_lag_ms, shadow_binance_px_t1, shadow_ret_bps, pm_fav, state,
+  stop_px, exit_reason, sl_slip_bps, clock_offset_ms, clock_rtt_ms
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		w.WindowTS, w.DecisionTS, w.QuoteTS, w.PUp, w.PDown, w.Spread, w.QuoteSource, w.Side, w.SkipReason,
 		nullF(w.LighterEntryTS.Float64, w.LighterEntryTS.Valid),
 		nullF(w.LighterEntryPx.Float64, w.LighterEntryPx.Valid),
@@ -171,6 +189,11 @@ INSERT INTO windows(
 		nullF(w.ShadowRetBps.Float64, w.ShadowRetBps.Valid),
 		nullF(w.PMFav.Float64, w.PMFav.Valid),
 		w.State,
+		nullF(w.StopPx.Float64, w.StopPx.Valid),
+		w.ExitReason,
+		nullF(w.SLSlipBps.Float64, w.SLSlipBps.Valid),
+		nullF(w.ClockOffsetMS.Float64, w.ClockOffsetMS.Valid),
+		nullF(w.ClockRTTMS.Float64, w.ClockRTTMS.Valid),
 	)
 	if err != nil {
 		return fmt.Errorf("insert window %d: %w", w.WindowTS, err)
@@ -190,7 +213,8 @@ UPDATE windows SET
   decision_ts=?, quote_ts=?, p_up=?, p_down=?, spread=?, quote_source=?, side=?, skip_reason=?,
   lighter_entry_ts=?, lighter_entry_px=?, lighter_exit_ts=?, lighter_exit_px=?,
   qty=?, notional=?, equity_before=?, equity_after=?, pnl_usd=?, ret_bps=?, fees_usd=?,
-  entry_lag_ms=?, fill_lag_ms=?, shadow_binance_px_t1=?, shadow_ret_bps=?, pm_fav=?, state=?
+  entry_lag_ms=?, fill_lag_ms=?, shadow_binance_px_t1=?, shadow_ret_bps=?, pm_fav=?, state=?,
+  stop_px=?, exit_reason=?, sl_slip_bps=?, clock_offset_ms=?, clock_rtt_ms=?
 WHERE window_ts=?`,
 		w.DecisionTS, w.QuoteTS, w.PUp, w.PDown, w.Spread, w.QuoteSource, w.Side, w.SkipReason,
 		nullF(w.LighterEntryTS.Float64, w.LighterEntryTS.Valid),
@@ -209,7 +233,13 @@ WHERE window_ts=?`,
 		nullF(w.ShadowBinancePxT1.Float64, w.ShadowBinancePxT1.Valid),
 		nullF(w.ShadowRetBps.Float64, w.ShadowRetBps.Valid),
 		nullF(w.PMFav.Float64, w.PMFav.Valid),
-		w.State, w.WindowTS,
+		w.State,
+		nullF(w.StopPx.Float64, w.StopPx.Valid),
+		w.ExitReason,
+		nullF(w.SLSlipBps.Float64, w.SLSlipBps.Valid),
+		nullF(w.ClockOffsetMS.Float64, w.ClockOffsetMS.Valid),
+		nullF(w.ClockRTTMS.Float64, w.ClockRTTMS.Valid),
+		w.WindowTS,
 	)
 	return err
 }
@@ -220,13 +250,15 @@ SELECT window_ts, IFNULL(decision_ts,0), IFNULL(quote_ts,0), IFNULL(p_up,0), IFN
   IFNULL(quote_source,''), side, IFNULL(skip_reason,''),
   lighter_entry_ts, lighter_entry_px, lighter_exit_ts, lighter_exit_px,
   qty, notional, equity_before, equity_after, pnl_usd, ret_bps, fees_usd,
-  entry_lag_ms, fill_lag_ms, shadow_binance_px_t1, shadow_ret_bps, pm_fav, IFNULL(state,'')
+  entry_lag_ms, fill_lag_ms, shadow_binance_px_t1, shadow_ret_bps, pm_fav, IFNULL(state,''),
+  stop_px, IFNULL(exit_reason,''), sl_slip_bps, clock_offset_ms, clock_rtt_ms
 FROM windows WHERE window_ts=?`, ts)
 	var w Window
 	err := row.Scan(&w.WindowTS, &w.DecisionTS, &w.QuoteTS, &w.PUp, &w.PDown, &w.Spread, &w.QuoteSource, &w.Side, &w.SkipReason,
 		&w.LighterEntryTS, &w.LighterEntryPx, &w.LighterExitTS, &w.LighterExitPx,
 		&w.Qty, &w.Notional, &w.EquityBefore, &w.EquityAfter, &w.PnLUSD, &w.RetBps, &w.FeesUSD,
-		&w.EntryLagMS, &w.FillLagMS, &w.ShadowBinancePxT1, &w.ShadowRetBps, &w.PMFav, &w.State)
+		&w.EntryLagMS, &w.FillLagMS, &w.ShadowBinancePxT1, &w.ShadowRetBps, &w.PMFav, &w.State,
+		&w.StopPx, &w.ExitReason, &w.SLSlipBps, &w.ClockOffsetMS, &w.ClockRTTMS)
 	return w, err
 }
 
@@ -239,7 +271,8 @@ SELECT window_ts, IFNULL(decision_ts,0), IFNULL(quote_ts,0), IFNULL(p_up,0), IFN
   IFNULL(quote_source,''), side, IFNULL(skip_reason,''),
   lighter_entry_ts, lighter_entry_px, lighter_exit_ts, lighter_exit_px,
   qty, notional, equity_before, equity_after, pnl_usd, ret_bps, fees_usd,
-  entry_lag_ms, fill_lag_ms, shadow_binance_px_t1, shadow_ret_bps, pm_fav, IFNULL(state,'')
+  entry_lag_ms, fill_lag_ms, shadow_binance_px_t1, shadow_ret_bps, pm_fav, IFNULL(state,''),
+  stop_px, IFNULL(exit_reason,''), sl_slip_bps, clock_offset_ms, clock_rtt_ms
 FROM windows ORDER BY window_ts DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -251,7 +284,8 @@ FROM windows ORDER BY window_ts DESC LIMIT ?`, limit)
 		if err := rows.Scan(&w.WindowTS, &w.DecisionTS, &w.QuoteTS, &w.PUp, &w.PDown, &w.Spread, &w.QuoteSource, &w.Side, &w.SkipReason,
 			&w.LighterEntryTS, &w.LighterEntryPx, &w.LighterExitTS, &w.LighterExitPx,
 			&w.Qty, &w.Notional, &w.EquityBefore, &w.EquityAfter, &w.PnLUSD, &w.RetBps, &w.FeesUSD,
-			&w.EntryLagMS, &w.FillLagMS, &w.ShadowBinancePxT1, &w.ShadowRetBps, &w.PMFav, &w.State); err != nil {
+			&w.EntryLagMS, &w.FillLagMS, &w.ShadowBinancePxT1, &w.ShadowRetBps, &w.PMFav, &w.State,
+			&w.StopPx, &w.ExitReason, &w.SLSlipBps, &w.ClockOffsetMS, &w.ClockRTTMS); err != nil {
 			return nil, err
 		}
 		out = append(out, w)
@@ -440,6 +474,8 @@ type Stats struct {
 	P90LagMS      float64  `json:"p90_lag_ms"`
 	P50FillLagMS  float64  `json:"p50_fill_lag_ms"`
 	P90FillLagMS  float64  `json:"p90_fill_lag_ms"`
+	NClockSkip    int      `json:"n_clock_skip"`
+	NSL           int      `json:"n_sl"`
 }
 
 func (s *Store) ComputeStats(ctx context.Context) (Stats, error) {
@@ -448,6 +484,8 @@ func (s *Store) ComputeStats(ctx context.Context) (Stats, error) {
 	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE quote_source != '' AND skip_reason NOT IN ('no_market','clock')`).Scan(&st.NQuoted)
 	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE side IN ('long','short') AND lighter_entry_px IS NOT NULL`).Scan(&st.NTrades)
 	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE side='skip'`).Scan(&st.NSkip)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE skip_reason = 'clock' OR skip_reason LIKE 'clock,%' OR skip_reason LIKE '%,clock'`).Scan(&st.NClockSkip)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE exit_reason = 'sl'`).Scan(&st.NSL)
 	if st.NWindows > 0 {
 		st.Coverage = float64(st.NQuoted) / float64(st.NWindows)
 	}

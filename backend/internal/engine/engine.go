@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +60,8 @@ type Engine struct {
 	mu          sync.Mutex
 	state       string
 	offset      time.Duration
+	offsetOK    bool
+	clockRTT    time.Duration
 	pos         *livePos
 	lastQuote   strategy.Quote
 	lastSkip    string
@@ -212,7 +215,7 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 			return err
 		}
 	}
-	if err := e.arm(ctx, next); err != nil {
+	if err := e.arm(ctx, next, 3); err != nil {
 		e.Log.Warn("arm", "err", err, "ts", next)
 	}
 	open := time.Unix(next, 0).UTC()
@@ -222,12 +225,12 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 	return e.decide(ctx, next)
 }
 
-func (e *Engine) arm(ctx context.Context, ts int64) error {
+func (e *Engine) arm(ctx context.Context, ts int64, clockProbes int) error {
 	e.setState(StateArming)
-	if err := e.syncClock(ctx); err != nil {
+	if err := e.syncClock(ctx, clockProbes); err != nil {
 		e.Log.Warn("clock", "err", err)
 	}
-	if absDur(e.offset) > e.Cfg.ClockAlertOffset {
+	if e.offsetOK && absDur(e.offset) > e.Cfg.ClockAlertOffset {
 		e.alert(ctx, "warn", "clock", fmt.Sprintf("offset=%s", e.offset))
 	}
 	slug := e.Cfg.EventSlug(ts)
@@ -247,15 +250,31 @@ func (e *Engine) arm(ctx context.Context, ts int64) error {
 	return nil
 }
 
-func (e *Engine) syncClock(ctx context.Context) error {
-	off, err := clock.MeasureBinanceOffset(ctx, nil, e.Cfg.BinanceURL)
+func (e *Engine) syncClock(ctx context.Context, n int) error {
+	s, err := clock.MeasureBinanceOffsetStable(ctx, nil, e.Cfg.BinanceURL, n)
 	if err != nil {
 		return err
 	}
 	e.mu.Lock()
-	e.offset = off
+	e.offset = s.Offset
+	e.clockRTT = s.RTT
+	e.offsetOK = true
 	e.mu.Unlock()
+	e.Log.Info("clock", "offset", s.Offset, "rtt", s.RTT, "n", n)
 	return nil
+}
+
+func (e *Engine) stampClock(w *store.Window) {
+	e.mu.Lock()
+	ok := e.offsetOK
+	off := e.offset
+	rtt := e.clockRTT
+	e.mu.Unlock()
+	if !ok {
+		return
+	}
+	w.ClockOffsetMS = sql.NullFloat64{Float64: off.Seconds() * 1000, Valid: true}
+	w.ClockRTTMS = sql.NullFloat64{Float64: rtt.Seconds() * 1000, Valid: true}
 }
 
 func (e *Engine) decide(ctx context.Context, ts int64) error {
@@ -270,14 +289,12 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 
 	w := store.Window{WindowTS: ts, Side: strategy.SideSkip, State: "decide"}
+	e.stampClock(&w)
 	if err := e.Store.InsertWindow(ctx, w); err != nil {
 		e.Log.Warn("unique window", "err", err)
 		return e.sleepToExit(ctx, ts)
 	}
 
-	if absDur(e.offset) > e.Cfg.ClockSkipOffset {
-		return e.finishSkip(ctx, w, "clock", "clock offset > 1s")
-	}
 	if e.isHalted() {
 		return e.finishSkip(ctx, w, "halt", "halted")
 	}
@@ -292,12 +309,20 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	armed := e.armedFor == ts
 	e.mu.Unlock()
 	if !armed {
-		if err := e.arm(ctx, ts); err != nil {
+		if err := e.arm(ctx, ts, 1); err != nil {
 			return e.finishSkip(ctx, w, "no_market", err.Error())
 		}
 		e.mu.Lock()
 		mkt = e.armedMarket
 		e.mu.Unlock()
+	}
+	// One probe at ts: keep last trusted offset if this RTT is junk (5s hang ≠ clock skew).
+	if err := e.syncClock(ctx, 1); err != nil {
+		e.Log.Warn("clock", "err", err, "keep_last", e.offsetOK)
+	}
+	if e.offsetOK && absDur(e.offset) > e.Cfg.ClockSkipOffset {
+		e.stampClock(&w)
+		return e.finishSkip(ctx, w, "clock", "clock offset > 1s")
 	}
 	if mkt.TokenUp == "" {
 		return e.finishSkip(ctx, w, "no_market", "empty tokens")
@@ -390,7 +415,6 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 
 	res, err := e.Signer.MarketIOC(e.Cfg.Symbol, buy, qty, px, e.Cfg.MarketSlippage, clientIdx, false)
-	sentTS := e.unix()
 	_ = e.Store.InsertOrder(ctx, ts, "entry", errString(err, "sent"), clientIdx, hashOf(res), qty, px, nil)
 	if err != nil {
 		return e.finishSkip(ctx, w, "order_failed", err.Error())
@@ -457,6 +481,10 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	w.FeesUSD = sql.NullFloat64{Float64: fee, Valid: true}
 	w.FillLagMS = sql.NullFloat64{Float64: (e.unix() - float64(ts)) * 1000, Valid: true}
 	w.State = StateInPosition
+	if stopPx > 0 {
+		w.StopPx = sql.NullFloat64{Float64: stopPx, Valid: true}
+	}
+	e.stampClock(&w)
 	_ = e.Store.UpdateWindow(ctx, w)
 	e.setState(StateInPosition)
 	e.flogWindow("entry", w)
@@ -467,7 +495,9 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 func (e *Engine) finishSkip(ctx context.Context, w store.Window, reason, msg string) error {
 	w.Side = strategy.SideSkip
 	w.SkipReason = reason
+	w.ExitReason = "skip"
 	w.State = "skip"
+	e.stampClock(&w)
 	if w.DecisionTS == 0 {
 		w.DecisionTS = e.unix()
 	}
@@ -562,6 +592,23 @@ func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string)
 	w.RetBps = sql.NullFloat64{Float64: ret * 1e4, Valid: true}
 	w.FeesUSD = sql.NullFloat64{Float64: fees, Valid: true}
 	w.State = "closed"
+	if reason == "stop" {
+		w.ExitReason = "sl"
+		if pos.StopPx > 0 {
+			w.StopPx = sql.NullFloat64{Float64: pos.StopPx, Valid: true}
+			w.SLSlipBps = sql.NullFloat64{Float64: strategy.SLSlipBps(pos.EntryPx, px, pos.Side, e.Cfg.StopPricePct), Valid: true}
+		}
+	} else if reason == "stop_missing" {
+		w.ExitReason = "stop_missing"
+	} else if strings.HasPrefix(reason, "halt") {
+		w.ExitReason = "halt"
+	} else {
+		w.ExitReason = "window_close"
+	}
+	if pos.StopPx > 0 && !w.StopPx.Valid {
+		w.StopPx = sql.NullFloat64{Float64: pos.StopPx, Valid: true}
+	}
+	e.stampClock(&w)
 	if late {
 		w.SkipReason = joinReason(w.SkipReason, "exit_late")
 		e.bumpLateStreak(ctx, true)
@@ -810,7 +857,7 @@ func (e *Engine) Health() (bool, string) {
 	if e.global.KillSwitch {
 		return false, "kill-switch"
 	}
-	if absDur(e.offset) > e.Cfg.ClockSkipOffset {
+	if e.offsetOK && absDur(e.offset) > e.Cfg.ClockSkipOffset {
 		return false, "clock offset"
 	}
 	return true, e.state

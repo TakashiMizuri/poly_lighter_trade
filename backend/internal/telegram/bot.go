@@ -190,8 +190,9 @@ func (b *Bot) handle(ctx context.Context, chat int64, text string) {
 	case "/status":
 		sn := b.Engine.Snapshot(ctx)
 		_ = b.sendHTML(chat, fmt.Sprintf(
-			"<b>Status</b>\n%s · %s\nstate=%s pos=%s\nequity=%.2f p_up=%.3f\nkill=%v halt=%s",
-			sn.Profile, sn.Network, sn.State, sn.Position, sn.Equity, sn.PUp, sn.KillSwitch, sn.HaltReason,
+			"<b>Status</b>\n%s · %s\nstate=%s pos=%s\nequity=%.2f p_up=%.3f spread=%.3f\nkill=%v halt=%s\nclock_binance=%+.0f ms ok=%v rtt=%.0f ms\nwindow=%d +%.0fs / 300\nlev=%.1fx stop=%.4f%%",
+			sn.Profile, sn.Network, sn.State, sn.Position, sn.Equity, sn.PUp, sn.Spread, sn.KillSwitch, sn.HaltReason,
+			sn.ClockOffsetMS, sn.ClockOK, sn.ClockRTTMS, sn.WindowTS, sn.SecsIntoWindow, sn.Leverage, sn.StopPricePct*100,
 		))
 	case "/trades":
 		rows, err := b.Engine.Store.ListWindows(ctx, 40)

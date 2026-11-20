@@ -9,6 +9,12 @@ export type Status = {
   halted: boolean;
   halt_reason: string;
   clock_offset_ms: number;
+  clock_ok: boolean;
+  clock_rtt_ms: number;
+  host_unix: number;
+  synced_unix: number;
+  secs_into_window: number;
+  secs_to_close: number;
   window_ts: number;
   next_ts: number;
   p_up: number;
@@ -19,6 +25,8 @@ export type Status = {
   position: string;
   qty: number;
   entry_px: number;
+  stop_px: number;
+  stop_price_pct: number;
   entry_window_ts: number;
   equity: number;
   peak_equity: number;
@@ -47,6 +55,8 @@ export type Stats = {
   p90_lag_ms: number;
   p50_fill_lag_ms: number;
   p90_fill_lag_ms: number;
+  n_clock_skip: number;
+  n_sl: number;
 };
 
 export type NullF = { Float64: number; Valid: boolean } | number | null;
@@ -78,6 +88,11 @@ export type WindowRow = {
   shadow_ret_bps: NullF;
   pm_fav: NullF;
   state: string;
+  stop_px: NullF;
+  exit_reason: string;
+  sl_slip_bps: NullF;
+  clock_offset_ms: NullF;
+  clock_rtt_ms: NullF;
 };
 
 export type EquityPoint = { ts: number; live: number; shadow: number };
