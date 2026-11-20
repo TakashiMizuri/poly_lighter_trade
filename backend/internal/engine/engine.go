@@ -215,7 +215,12 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 			return err
 		}
 	}
-	if err := e.arm(ctx, next, 3); err != nil {
+	// Binance clock only if we still have time before open. Never stall :00 for NTP.
+	probes := 3
+	if !e.now().Before(time.Unix(next, 0).UTC().Add(-3 * time.Second)) {
+		probes = 0
+	}
+	if err := e.arm(ctx, next, probes); err != nil {
 		e.Log.Warn("arm", "err", err, "ts", next)
 	}
 	open := time.Unix(next, 0).UTC()
@@ -227,11 +232,13 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 
 func (e *Engine) arm(ctx context.Context, ts int64, clockProbes int) error {
 	e.setState(StateArming)
-	if err := e.syncClock(ctx, clockProbes); err != nil {
-		e.Log.Warn("clock", "err", err)
-	}
-	if e.offsetOK && absDur(e.offset) > e.Cfg.ClockAlertOffset {
-		e.alert(ctx, "warn", "clock", fmt.Sprintf("offset=%s", e.offset))
+	if clockProbes > 0 {
+		if err := e.syncClock(ctx, clockProbes); err != nil {
+			e.Log.Warn("clock", "err", err)
+		}
+		if e.offsetOK && absDur(e.offset) > e.Cfg.ClockAlertOffset {
+			e.alert(ctx, "warn", "clock", fmt.Sprintf("offset=%s", e.offset))
+		}
 	}
 	slug := e.Cfg.EventSlug(ts)
 	mkt, err := e.PM.Resolve(ctx, slug)
@@ -309,16 +316,12 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	armed := e.armedFor == ts
 	e.mu.Unlock()
 	if !armed {
-		if err := e.arm(ctx, ts, 1); err != nil {
+		if err := e.arm(ctx, ts, 0); err != nil {
 			return e.finishSkip(ctx, w, "no_market", err.Error())
 		}
 		e.mu.Lock()
 		mkt = e.armedMarket
 		e.mu.Unlock()
-	}
-	// One probe at ts: keep last trusted offset if this RTT is junk (5s hang ≠ clock skew).
-	if err := e.syncClock(ctx, 1); err != nil {
-		e.Log.Warn("clock", "err", err, "keep_last", e.offsetOK)
 	}
 	if e.offsetOK && absDur(e.offset) > e.Cfg.ClockSkipOffset {
 		e.stampClock(&w)
