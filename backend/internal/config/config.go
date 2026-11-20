@@ -37,7 +37,6 @@ type Config struct {
 	Leverage        float64
 	EquityFraction  float64
 	MarketSlippage  float64
-	ExitSlippage    float64
 	StopPricePct    float64
 	ShadowBinance1s bool
 
@@ -88,8 +87,7 @@ func Load() (*Config, error) {
 		ExitEarly:             time.Duration(getenvFloat("EXIT_EARLY_SECONDS", 0.30) * float64(time.Second)),
 		Leverage:              getenvFloat("LIGHTER_LEVERAGE", 1),
 		EquityFraction:        getenvFloat("LIGHTER_EQUITY_FRACTION", 1.0),
-		MarketSlippage:        getenvFloat("MARKET_SLIPPAGE", 0.0005),
-		ExitSlippage:          getenvFloat("EXIT_MARKET_SLIPPAGE", 0.02),
+		MarketSlippage:        getenvFloat("MARKET_SLIPPAGE", 0.02),
 		StopPricePct:          getenvFloat("STOP_PRICE_PCT", 0.00125),
 		ShadowBinance1s:       getenvBool("SHADOW_BINANCE_1S", true),
 		HaltExitLateStreak:    getenvInt("HALT_ON_EXIT_LATE_STREAK", 3),
@@ -174,11 +172,8 @@ func Load() (*Config, error) {
 	if !finite(cfg.StopPricePct) || cfg.StopPricePct <= 0 || cfg.StopPricePct > 0.05 {
 		return nil, fmt.Errorf("STOP_PRICE_PCT must be in (0, 0.05] (default 0.00125 = 0.125%% of BTC price)")
 	}
-	if !finite(cfg.MarketSlippage) || cfg.MarketSlippage <= 0 || cfg.MarketSlippage > 0.01 {
-		return nil, fmt.Errorf("MARKET_SLIPPAGE must be in (0, 0.01]")
-	}
-	if !finite(cfg.ExitSlippage) || cfg.ExitSlippage <= 0 || cfg.ExitSlippage > 0.05 {
-		return nil, fmt.Errorf("EXIT_MARKET_SLIPPAGE must be in (0, 0.05]")
+	if !finite(cfg.MarketSlippage) || cfg.MarketSlippage <= 0 || cfg.MarketSlippage > 0.05 {
+		return nil, fmt.Errorf("MARKET_SLIPPAGE must be in (0, 0.05]")
 	}
 	if !finite(cfg.PrewarmSeconds) || cfg.PrewarmSeconds < 15 || cfg.PrewarmSeconds > 120 {
 		return nil, fmt.Errorf("PM_PREWARM_SECONDS must be in [15, 120] for POLY_LIGHTER_1")

@@ -721,7 +721,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		stopIdx = e.nextClientIdx(ctx)
 		tStop := time.Now()
 		sctx, scancel := context.WithTimeout(ctx, 1500*time.Millisecond)
-		stopResult, stopErr := e.Signer.StopLoss(sctx, e.Cfg.Symbol, side == strategy.SideLong, usedQty, stopPx, e.Cfg.ExitSlippage, stopIdx)
+		stopResult, stopErr := e.Signer.StopLoss(sctx, e.Cfg.Symbol, side == strategy.SideLong, usedQty, stopPx, e.Cfg.MarketSlippage, stopIdx)
 		scancel()
 		e.traceDur("stop", tStop)
 		status := errString(stopErr, "sent")
@@ -946,7 +946,7 @@ func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64
 	}
 	buy := pos.Side == strategy.SideShort // closing short = buy
 	idx := e.nextClientIdx(ctx)
-	res, err := e.Signer.MarketIOC(ctx, e.Cfg.Symbol, buy, pos.Qty, ref, e.Cfg.ExitSlippage, idx, true)
+	res, err := e.Signer.MarketIOC(ctx, e.Cfg.Symbol, buy, pos.Qty, ref, e.Cfg.MarketSlippage, idx, true)
 	_ = e.Store.InsertOrder(ctx, pos.WindowTS, "exit", errString(err, "sent"), idx, hashOf(res), pos.Qty, ref, nil)
 	if err != nil {
 		return 0, 0, err
