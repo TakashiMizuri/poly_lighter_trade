@@ -20,10 +20,14 @@ func (e *Engine) beginTrace(ts int64) {
 }
 
 func (e *Engine) traceDur(name string, started time.Time) {
+	e.traceDurElapsed(name, time.Since(started))
+}
+
+func (e *Engine) traceDurElapsed(name string, elapsed time.Duration) {
 	if e.tr == nil {
 		return
 	}
-	ms := float64(time.Since(started).Milliseconds())
+	ms := float64(elapsed.Milliseconds())
 	if ms < 0 {
 		ms = 0
 	}
@@ -72,6 +76,8 @@ func (e *Engine) traceOpenTo(which string, at time.Time) {
 		e.tr.t.MsOpenToDecide = ms
 	case "send":
 		e.tr.t.MsOpenToSend = ms
+	case "send_ack":
+		e.tr.t.MsOpenToSendAck = ms
 	case "exchange":
 		e.tr.t.MsOpenToExchange = ms
 	}
@@ -81,7 +87,7 @@ func (e *Engine) stampLateStart() {
 	if e.tr == nil {
 		return
 	}
-	late := time.Now().UTC().Sub(e.tr.open)
+	late := e.correctedTime(time.Now()).UTC().Sub(e.tr.open)
 	if late > 0 {
 		e.tr.t.MsLateStart = float64(late / time.Millisecond)
 	}

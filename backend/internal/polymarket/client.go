@@ -23,16 +23,19 @@ type Client struct {
 	WSURL string
 	HTTP  *http.Client
 
-	mu      sync.Mutex
-	books   map[string]*book
-	wsErr   string
-	wsOK    bool
-	armedTS int64
+	mu       sync.Mutex
+	books    map[string]*book
+	wsErr    string
+	wsOK     bool
+	armedTS  int64
+	armedMkt Market
+	wsCancel context.CancelFunc
 }
 
 type book struct {
 	bid, ask float64
 	recv     time.Time
+	source   string
 }
 
 type Market struct {
@@ -222,27 +225,26 @@ func (c *Client) GammaMid(ctx context.Context, slug string) (float64, error) {
 }
 
 func (c *Client) WarmREST(ctx context.Context, mkt Market) {
-	now := time.Now()
 	if mkt.TokenUp != "" {
 		if bid, ask, err := c.RESTBook(ctx, mkt.TokenUp); err == nil {
-			c.setBook(mkt.TokenUp, bid, ask, now)
+			c.setBook(mkt.TokenUp, bid, ask, time.Now(), "rest_clob")
 		}
 	}
 	if mkt.TokenDown != "" {
 		if bid, ask, err := c.RESTBook(ctx, mkt.TokenDown); err == nil {
-			c.setBook(mkt.TokenDown, bid, ask, now)
+			c.setBook(mkt.TokenDown, bid, ask, time.Now(), "rest_clob")
 		}
 	}
 }
 
 func (c *Client) SnapshotCached(mkt Market, now time.Time, maxAge time.Duration) (strategy.Quote, error) {
 	q := strategy.Quote{TokenUp: mkt.TokenUp, TokenDown: mkt.TokenDown}
-	bid, ask, recv, ok := c.cached(mkt.TokenUp, now, maxAge)
+	bid, ask, recv, source, ok := c.cached(mkt.TokenUp, now, maxAge)
 	if !ok {
 		return q, fmt.Errorf("no live book")
 	}
-	q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, recv, "ws_clob"
-	if dBid, dAsk, _, dOK := c.cached(mkt.TokenDown, now, maxAge); dOK {
+	q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, recv, source
+	if dBid, dAsk, _, _, dOK := c.cached(mkt.TokenDown, now, maxAge); dOK {
 		q.BidDown, q.AskDown, q.HasDown = dBid, dAsk, true
 	}
 	return q, nil
@@ -255,10 +257,7 @@ func (c *Client) SnapshotUp(ctx context.Context, mkt Market, now time.Time, maxA
 	q := strategy.Quote{TokenUp: mkt.TokenUp, TokenDown: mkt.TokenDown}
 	bid, ask, err := c.RESTBook(ctx, mkt.TokenUp)
 	if err == nil {
-		q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, now, "rest_clob"
-		if dBid, dAsk, dErr := c.RESTBook(ctx, mkt.TokenDown); dErr == nil {
-			q.BidDown, q.AskDown, q.HasDown = dBid, dAsk, true
-		}
+		q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, time.Now(), "rest_clob"
 		return q, nil
 	}
 	mid, gerr := c.GammaMid(ctx, mkt.Slug)
@@ -271,63 +270,91 @@ func (c *Client) SnapshotUp(ctx context.Context, mkt Market, now time.Time, maxA
 		q.BidUp = mid
 		q.AskUp = mid
 	}
-	q.Recv, q.Source = now, "gamma"
+	q.Recv, q.Source = time.Now(), "gamma"
 	return q, nil
 }
 
-func (c *Client) cached(token string, now time.Time, maxAge time.Duration) (bid, ask float64, recv time.Time, ok bool) {
+func (c *Client) cached(token string, now time.Time, maxAge time.Duration) (bid, ask float64, recv time.Time, source string, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b := c.books[token]
 	if b == nil || b.bid <= 0 || b.ask <= 0 {
-		return 0, 0, time.Time{}, false
+		return 0, 0, time.Time{}, "", false
 	}
 	if now.Sub(b.recv) > maxAge {
-		return 0, 0, time.Time{}, false
+		return 0, 0, time.Time{}, "", false
 	}
-	return b.bid, b.ask, b.recv, true
+	return b.bid, b.ask, b.recv, b.source, true
 }
 
-func (c *Client) setBook(token string, bid, ask float64, recv time.Time) {
+func (c *Client) setBook(token string, bid, ask float64, recv time.Time, source string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if bid > 0 && ask > 0 {
-		c.books[token] = &book{bid: bid, ask: ask, recv: recv}
+		c.books[token] = &book{bid: bid, ask: ask, recv: recv, source: source}
 	}
 }
 
 func (c *Client) Arm(ts int64, mkt Market) {
 	c.mu.Lock()
+	if c.wsCancel != nil {
+		c.wsCancel()
+	}
+	if c.armedMkt.TokenUp != "" {
+		delete(c.books, c.armedMkt.TokenUp)
+		delete(c.books, c.armedMkt.TokenDown)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.wsCancel = cancel
 	c.armedTS = ts
+	c.armedMkt = mkt
+	c.wsOK, c.wsErr = false, "connecting"
 	c.mu.Unlock()
-	go c.runWS(context.Background(), mkt)
+	go c.runWS(ctx, mkt)
 }
 
 func (c *Client) runWS(ctx context.Context, mkt Market) {
+	backoff := 250 * time.Millisecond
+	for ctx.Err() == nil {
+		if err := c.runWSConn(ctx, mkt); err != nil && ctx.Err() == nil {
+			c.mu.Lock()
+			c.wsOK, c.wsErr = false, err.Error()
+			c.mu.Unlock()
+		}
+		t := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+		if backoff < 3*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func (c *Client) runWSConn(ctx context.Context, mkt Market) error {
 	dialer := websocket.Dialer{HandshakeTimeout: 8 * time.Second}
 	conn, _, err := dialer.DialContext(ctx, c.WSURL, nil)
 	if err != nil {
-		c.mu.Lock()
-		c.wsOK, c.wsErr = false, err.Error()
-		c.mu.Unlock()
-		return
+		return err
 	}
 	defer conn.Close()
 	sub := map[string]any{
-		"type":       "market",
-		"assets_ids": []string{mkt.TokenUp, mkt.TokenDown},
+		"type":                   "market",
+		"assets_ids":             []string{mkt.TokenUp, mkt.TokenDown},
+		"custom_feature_enabled": true,
 	}
 	if err := conn.WriteJSON(sub); err != nil {
-		c.mu.Lock()
-		c.wsOK, c.wsErr = false, err.Error()
-		c.mu.Unlock()
-		return
+		return err
 	}
 	c.mu.Lock()
 	c.wsOK, c.wsErr = true, ""
 	c.mu.Unlock()
 
 	done := make(chan struct{})
+	connDone := make(chan struct{})
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
@@ -341,15 +368,20 @@ func (c *Client) runWS(ctx context.Context, mkt Market) {
 		}
 	}()
 	defer close(done)
+	defer close(connDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-connDone:
+		}
+	}()
 
 	conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			c.mu.Lock()
-			c.wsOK, c.wsErr = false, err.Error()
-			c.mu.Unlock()
-			return
+			return err
 		}
 		conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 		c.handleWS(data, time.Now())
@@ -379,21 +411,50 @@ func (c *Client) applyWS(msg map[string]any, now time.Time) {
 	if event == "" {
 		event, _ = msg["type"].(string)
 	}
+	if event == "" {
+		event, _ = msg["eventType"].(string)
+	}
+	if payload, ok := msg["payload"].(map[string]any); ok {
+		msg = payload
+	}
 	asset, _ := msg["asset_id"].(string)
 	if asset == "" {
 		asset, _ = msg["assetId"].(string)
+	}
+	if asset == "" {
+		asset, _ = msg["assetID"].(string)
 	}
 	switch event {
 	case "book", "best_bid_ask":
 		bid, ask := extractBBO(msg)
 		if asset != "" {
-			c.setBook(asset, bid, ask, now)
+			c.setBook(asset, bid, ask, now, "ws_clob")
 		}
 	case "price_change", "price_changes":
-		// keep last BBO if present
+		changes, ok := msg["price_changes"].([]any)
+		if !ok {
+			changes, ok = msg["priceChanges"].([]any)
+		}
+		if ok {
+			for _, raw := range changes {
+				change, _ := raw.(map[string]any)
+				if change == nil {
+					continue
+				}
+				id, _ := change["asset_id"].(string)
+				if id == "" {
+					id, _ = change["assetId"].(string)
+				}
+				bid, ask := extractBBO(change)
+				if id != "" && bid > 0 && ask > 0 {
+					c.setBook(id, bid, ask, now, "ws_clob")
+				}
+			}
+			return
+		}
 		bid, ask := extractBBO(msg)
 		if asset != "" && bid > 0 && ask > 0 {
-			c.setBook(asset, bid, ask, now)
+			c.setBook(asset, bid, ask, now, "ws_clob")
 		}
 	}
 }
@@ -403,6 +464,12 @@ func extractBBO(msg map[string]any) (bid, ask float64) {
 		bid = v
 	}
 	if v, ok := asFloat(msg["best_ask"]); ok {
+		ask = v
+	}
+	if v, ok := asFloat(msg["bestBid"]); ok {
+		bid = v
+	}
+	if v, ok := asFloat(msg["bestAsk"]); ok {
 		ask = v
 	}
 	if bids, ok := msg["bids"].([]any); ok {

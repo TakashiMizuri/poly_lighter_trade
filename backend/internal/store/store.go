@@ -495,7 +495,9 @@ type Stats struct {
 func (s *Store) ComputeStats(ctx context.Context) (Stats, error) {
 	var st Stats
 	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows`).Scan(&st.NWindows)
-	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE quote_source != '' AND skip_reason NOT IN ('no_market','clock')`).Scan(&st.NQuoted)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows
+WHERE quote_source != '' AND quote_ts IS NOT NULL
+  AND quote_ts >= window_ts AND quote_ts <= window_ts + 1.0`).Scan(&st.NQuoted)
 	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE side IN ('long','short') AND lighter_entry_px IS NOT NULL`).Scan(&st.NTrades)
 	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE side='skip'`).Scan(&st.NSkip)
 	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE skip_reason = 'clock' OR skip_reason LIKE 'clock,%' OR skip_reason LIKE '%,clock'`).Scan(&st.NClockSkip)

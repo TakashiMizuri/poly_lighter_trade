@@ -11,25 +11,25 @@ func TestEventSlug(t *testing.T) {
 	}
 }
 
-func TestLeverageAllowed(t *testing.T) {
+func TestStrategyProfileDefaultsAllowed(t *testing.T) {
 	t.Setenv("DASHBOARD_PASSWORD", "x")
 	t.Setenv("LIGHTER_API_KEY_INDEX", "4")
 	t.Setenv("LIGHTER_NETWORK", "mainnet")
-	t.Setenv("LIGHTER_LEVERAGE", "3")
+	t.Setenv("LIGHTER_LEVERAGE", "1")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Leverage != 3 {
+	if cfg.Leverage != 1 {
 		t.Fatalf("got %v", cfg.Leverage)
 	}
 }
 
-func TestLeverageRejectedOver50(t *testing.T) {
+func TestStrategyProfileRejectsLeverageOverride(t *testing.T) {
 	t.Setenv("DASHBOARD_PASSWORD", "x")
 	t.Setenv("LIGHTER_API_KEY_INDEX", "4")
 	t.Setenv("LIGHTER_NETWORK", "mainnet")
-	t.Setenv("LIGHTER_LEVERAGE", "51")
+	t.Setenv("LIGHTER_LEVERAGE", "3")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected reject")
 	}

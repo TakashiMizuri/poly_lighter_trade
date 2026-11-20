@@ -58,9 +58,11 @@ type Engine struct {
 	Log     *slog.Logger
 
 	mu          sync.Mutex
+	clockSyncMu sync.Mutex
 	state       string
 	offset      time.Duration
 	offsetOK    bool
+	offsetAt    time.Time
 	clockRTT    time.Duration
 	pos         *livePos
 	lastQuote   strategy.Quote
@@ -76,6 +78,7 @@ type Engine struct {
 	readyEq     float64
 	readyPx     float64
 	readyAt     time.Time
+	readyOK     bool
 	tr          *winTrace
 	lastTimings *store.Timings
 }
@@ -94,8 +97,67 @@ func New(cfg *config.Config, st *store.Store, httpClient *lighter.HTTPClient, si
 }
 
 func (e *Engine) now() time.Time {
-	// Window grid is UTC wall clock. Binance offset is telemetry only — never shift :00.
+	// Window scheduling follows the host's UTC clock; Binance offset is used to
+	// validate the real entry deadline, not to step or silently shift the host.
 	return time.Now().UTC()
+}
+
+func (e *Engine) entryClock() (time.Time, bool) {
+	e.mu.Lock()
+	off, ok, measured := e.offset, e.offsetOK, e.offsetAt
+	e.mu.Unlock()
+	if !ok || measured.IsZero() || time.Since(measured) > 2*time.Minute {
+		return time.Time{}, false
+	}
+	return time.Now().Add(off), true
+}
+
+func (e *Engine) clockOffset() (time.Duration, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.offsetOK || e.offsetAt.IsZero() || time.Since(e.offsetAt) > 2*time.Minute {
+		return 0, false
+	}
+	return e.offset, true
+}
+
+func (e *Engine) clockSample() (offset, rtt time.Duration, ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.offsetOK || e.offsetAt.IsZero() || time.Since(e.offsetAt) > 2*time.Minute {
+		return 0, 0, false
+	}
+	return e.offset, e.clockRTT, true
+}
+
+func (e *Engine) entryDeadline(ts int64) (time.Time, bool) {
+	e.mu.Lock()
+	off, rtt, ok := e.offset, e.clockRTT, e.offsetOK
+	measured := e.offsetAt
+	e.mu.Unlock()
+	if !ok || measured.IsZero() || time.Since(measured) > 2*time.Minute {
+		return time.Time{}, false
+	}
+	return time.Unix(ts, 0).Add(e.Cfg.EntryMaxLag).Add(-off - rtt/2), true
+}
+
+func (e *Engine) entryElapsed(ts int64) (mid, lower, upper time.Duration, ok bool) {
+	off, rtt, ok := e.clockSample()
+	if !ok {
+		return 0, 0, 0, false
+	}
+	mid = time.Now().Add(off).Sub(time.Unix(ts, 0).UTC())
+	return mid, mid - rtt/2, mid + rtt/2, true
+}
+
+func (e *Engine) correctedTime(local time.Time) time.Time {
+	e.mu.Lock()
+	off, ok := e.offset, e.offsetOK
+	e.mu.Unlock()
+	if ok {
+		return local.Add(off)
+	}
+	return local
 }
 
 func (e *Engine) unix() float64 {
@@ -115,8 +177,8 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	}
 	e.global = g
 	e.bootWindow = clock.WindowOf(e.now())
-	if e.Signer != nil && !e.Cfg.DryRun && e.Cfg.Leverage >= 1 {
-		if err := e.Signer.UpdateLeverage(e.Cfg.Symbol, e.Cfg.Leverage); err != nil {
+	if e.Signer != nil && !e.Cfg.DryRun {
+		if err := e.Signer.UpdateLeverage(ctx, e.Cfg.Symbol, e.Cfg.Leverage); err != nil {
 			e.Log.Warn("update leverage", "err", err, "leverage", e.Cfg.Leverage)
 			e.alert(ctx, "warn", "leverage", fmt.Sprintf("не выставили %gx на бирже: %v", e.Cfg.Leverage, err))
 		} else {
@@ -207,10 +269,6 @@ func (e *Engine) tick(ctx context.Context) error {
 		return e.waitNextOpen(ctx, ts+clock.WindowSec)
 	}
 
-	if e.now().Sub(time.Unix(ts, 0).UTC()) >= e.Cfg.EntryMaxLag {
-		return e.waitNextOpen(ctx, ts+clock.WindowSec)
-	}
-
 	// Prewarm current if we arrived early (clock just crossed into last 15s of previous).
 	if now.Unix() < ts {
 		return e.waitNextOpen(ctx, ts)
@@ -221,19 +279,32 @@ func (e *Engine) tick(ctx context.Context) error {
 
 func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 	e.beginTrace(next)
-	prewarm := time.Unix(next, 0).UTC().Add(-time.Duration(e.Cfg.PrewarmSeconds * float64(time.Second)))
-	if e.now().Before(prewarm) {
+	serverOpen := time.Unix(next, 0).UTC()
+	initialPrewarm := serverOpen.Add(-time.Duration(e.Cfg.PrewarmSeconds * float64(time.Second)))
+	if e.now().Before(initialPrewarm) {
 		e.setState(StateIdle)
-		if err := clock.SleepUntil(ctx, prewarm, e.now); err != nil {
+		if err := clock.SleepUntil(ctx, initialPrewarm, e.now); err != nil {
 			return err
 		}
 	}
-	open := time.Unix(next, 0).UTC()
-	if e.now().Before(open.Add(-3 * time.Second)) {
+	if e.now().Before(serverOpen.Add(-3 * time.Second)) {
 		if err := e.syncClock(ctx, 3); err != nil {
 			e.Log.Warn("prewarm clock", "err", err)
-		} else if e.offsetOK && absDur(e.offset) > e.Cfg.ClockAlertOffset {
-			e.alert(ctx, "warn", "clock", fmt.Sprintf("offset=%s", e.offset))
+		} else if off, ok := e.clockOffset(); ok && absDur(off) > e.Cfg.ClockAlertOffset {
+			e.alert(ctx, "warn", "clock", fmt.Sprintf("offset=%s", off))
+		}
+	}
+	// Convert the exchange's UTC boundary to the host's wall clock using the
+	// measured server offset. This corrects both early and late wake-ups.
+	scheduleOpen := serverOpen
+	if off, rtt, ok := e.clockSample(); ok {
+		// Wait until even the earliest plausible server time has reached :00.
+		scheduleOpen = serverOpen.Add(-off + rtt/2)
+	}
+	prewarm := scheduleOpen.Add(-time.Duration(e.Cfg.PrewarmSeconds * float64(time.Second)))
+	if e.now().Before(prewarm) {
+		if err := clock.SleepUntil(ctx, prewarm, e.now); err != nil {
+			return err
 		}
 	}
 	tArm := time.Now()
@@ -244,54 +315,68 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 	tReady := time.Now()
 	_ = e.refreshReady(ctx)
 	e.traceDur("ready", tReady)
-	for e.now().Before(open.Add(-400 * time.Millisecond)) {
-		_ = e.refreshReady(ctx)
+	// Stop doing synchronous account/price work well before :00. A slow REST
+	// refresh must never consume the entry budget at the boundary.
+	for e.now().Before(scheduleOpen.Add(-1200 * time.Millisecond)) {
+		rctx, cancel := context.WithDeadline(ctx, scheduleOpen.Add(-800*time.Millisecond))
+		_ = e.refreshReady(rctx)
+		cancel()
 		wake := e.now().Add(time.Second)
-		if wake.After(open.Add(-400 * time.Millisecond)) {
-			wake = open.Add(-400 * time.Millisecond)
+		if wake.After(scheduleOpen.Add(-1200 * time.Millisecond)) {
+			wake = scheduleOpen.Add(-1200 * time.Millisecond)
 		}
 		if err := clock.SleepUntil(ctx, wake, e.now); err != nil {
 			return err
 		}
 	}
-	e.mu.Lock()
-	mkt := e.armedMarket
-	e.mu.Unlock()
-	if e.now().Before(open.Add(-80 * time.Millisecond)) {
-		wctx, cancel := context.WithDeadline(ctx, open.Add(-50*time.Millisecond))
-		if e.PM != nil {
-			tWarm := time.Now()
-			e.PM.WarmREST(wctx, mkt)
-			e.traceDur("warm_book", tWarm)
-		}
-		if e.HTTP != nil {
-			tN := time.Now()
-			_, _ = e.HTTP.GetNextNonce(e.Cfg.AccountIndex, e.Cfg.APIKeyIndex)
-			e.traceDur("nonce", tN)
-		}
-		cancel()
-	}
-	if err := clock.SleepUntil(ctx, open, e.now); err != nil {
+	if err := clock.SleepUntil(ctx, scheduleOpen, e.now); err != nil {
 		return err
 	}
 	return e.decide(ctx, next)
 }
 
 func (e *Engine) refreshReady(ctx context.Context) error {
-	eq, err := e.equity(ctx)
+	e.mu.Lock()
+	e.readyOK = false
+	e.mu.Unlock()
+	var eq float64
+	var flat bool
+	if e.HTTP != nil {
+		acc, err := e.HTTP.Account(ctx, e.Cfg.AccountIndex)
+		if err != nil {
+			return err
+		}
+		eq = acc.Equity()
+		_, open := acc.Position(e.Cfg.Symbol, e.Markets[e.Cfg.Symbol].MarketID)
+		flat = !open
+	} else {
+		var err error
+		eq, err = e.equity(ctx)
+		if err != nil {
+			return err
+		}
+		flat = true
+	}
+	px, err := e.btcPx(ctx)
 	if err != nil {
 		return err
 	}
-	px, err := e.btcPx(ctx)
-	if err != nil || px <= 0 {
-		return err
+	if px <= 0 || eq <= 0 {
+		return fmt.Errorf("invalid ready values: equity=%v price=%v", eq, px)
 	}
-	flat, _ := e.isFlat(ctx)
 	e.mu.Lock()
 	e.readyEq, e.readyPx, e.readyAt = eq, px, time.Now()
+	e.readyOK = flat || e.Cfg.DryRun
 	e.mu.Unlock()
 	if !flat && !e.Cfg.DryRun {
-		_ = e.ensureFlat(ctx, "prewarm")
+		go func() {
+			fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := e.ensureFlat(fctx, "prewarm"); err != nil {
+				e.Log.Error("prewarm flatten", "err", err)
+			}
+		}()
+		return fmt.Errorf("unexpected position flattened during prewarm; entry disabled for this window")
 	}
 	return nil
 }
@@ -311,20 +396,48 @@ func (e *Engine) arm(ctx context.Context, ts int64) error {
 	e.armedMarket = mkt
 	e.mu.Unlock()
 	e.PM.Arm(ts, mkt)
-	go e.PM.WarmREST(context.Background(), mkt)
+	warmCh := make(chan time.Duration, 1)
+	go func() {
+		wctx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		e.PM.WarmREST(wctx, mkt)
+		warmCh <- time.Since(started)
+	}()
+	if e.Signer != nil && !e.Cfg.DryRun {
+		nctx, cancel := context.WithTimeout(ctx, 700*time.Millisecond)
+		tNonce := time.Now()
+		if err := e.Signer.PrepareNonce(nctx); err != nil {
+			e.Log.Warn("prewarm nonce", "err", err, "ts", ts)
+		}
+		e.traceDur("nonce", tNonce)
+		cancel()
+	}
+	select {
+	case elapsed := <-warmCh:
+		e.traceDurElapsed("warm_book", elapsed)
+	case <-ctx.Done():
+	}
 	e.Log.Info("armed", "ts", ts, "slug", slug)
 	return nil
 }
 
 func (e *Engine) syncClock(ctx context.Context, n int) error {
+	e.clockSyncMu.Lock()
+	defer e.clockSyncMu.Unlock()
 	s, err := clock.MeasureBinanceOffsetStable(ctx, nil, e.Cfg.BinanceURL, n)
 	if err != nil {
+		e.mu.Lock()
+		e.offsetOK = false
+		e.offsetAt = time.Time{}
+		e.mu.Unlock()
 		return err
 	}
 	e.mu.Lock()
 	e.offset = s.Offset
 	e.clockRTT = s.RTT
 	e.offsetOK = true
+	e.offsetAt = time.Now()
 	e.mu.Unlock()
 	e.Log.Info("clock", "offset", s.Offset, "rtt", s.RTT, "n", n)
 	return nil
@@ -332,7 +445,7 @@ func (e *Engine) syncClock(ctx context.Context, n int) error {
 
 func (e *Engine) stampClock(w *store.Window) {
 	e.mu.Lock()
-	ok := e.offsetOK
+	ok := e.offsetOK && !e.offsetAt.IsZero() && time.Since(e.offsetAt) <= 2*time.Minute
 	off := e.offset
 	rtt := e.clockRTT
 	e.mu.Unlock()
@@ -378,11 +491,18 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "halt", "halted")
 	}
 
-	if e.now().Sub(time.Unix(ts, 0).UTC()) >= e.Cfg.EntryMaxLag {
-		return e.finishSkip(ctx, w, "late", "past T+2s")
+	_, earliest, latest, clockOK := e.entryElapsed(ts)
+	if !clockOK {
+		return e.finishSkip(ctx, w, "clock", "no recent trusted Binance time sample")
 	}
-	if e.offsetOK && absDur(e.offset) > e.Cfg.ClockSkipOffset {
-		return e.finishSkip(ctx, w, "clock", "clock offset > 1s")
+	if earliest < 0 {
+		return e.finishSkip(ctx, w, "clock", "clock uncertainty places decision before window open")
+	}
+	if off, ok := e.clockOffset(); !ok || absDur(off) > e.Cfg.ClockSkipOffset {
+		return e.finishSkip(ctx, w, "clock", "clock offset unavailable or > 1s")
+	}
+	if latest >= e.Cfg.EntryMaxLag {
+		return e.finishSkip(ctx, w, "late", "past T+2s")
 	}
 
 	e.mu.Lock()
@@ -404,11 +524,22 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "no_market", "empty tokens")
 	}
 
+	deadline, deadlineOK := e.entryDeadline(ts)
+	if !deadlineOK {
+		return e.finishSkip(ctx, w, "clock", "entry deadline unavailable")
+	}
+	qctx, qcancel := context.WithDeadline(ctx, deadline)
 	tQ := time.Now()
-	q, err := e.PM.SnapshotCached(mkt, e.now(), time.Second)
+	q, err := e.PM.SnapshotUp(qctx, mkt, e.now(), time.Second)
+	qcancel()
 	e.traceDur("quote", tQ)
-	e.traceOpenTo("quote", time.Now().UTC())
+	if elapsed, _, _, ok := e.entryElapsed(ts); ok {
+		e.traceOpenTo("quote", time.Unix(ts, 0).Add(elapsed))
+	}
 	if err != nil {
+		if _, _, latest, ok := e.entryElapsed(ts); ok && latest >= e.Cfg.EntryMaxLag {
+			return e.finishSkip(ctx, w, "late", "quote unavailable before T+2s: "+err.Error())
+		}
 		return e.finishSkip(ctx, w, "bad_quote", err.Error())
 	}
 	ok, why := strategy.QuoteOK(q, e.Cfg.MaxSpread, 1.0, e.now())
@@ -424,12 +555,17 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		pDown = (q.BidDown + q.AskDown) / 2
 	}
 	side, skipReason, both := strategy.DecideSide(pUp, e.Cfg.Threshold)
-	w.DecisionTS = e.unix()
-	w.QuoteTS = float64(q.Recv.UnixNano()) / 1e9
+	if decisionTime, ok := e.entryClock(); ok {
+		w.DecisionTS = float64(decisionTime.UnixNano()) / 1e9
+	} else {
+		return e.finishSkip(ctx, w, "clock", "clock sample expired during decision")
+	}
+	quoteTime := e.correctedTime(q.Recv)
+	w.QuoteTS = float64(quoteTime.UnixNano()) / 1e9
 	w.PUp, w.PDown, w.Spread = pUp, pDown, q.Spread()
 	w.QuoteSource = q.Source
 	w.PMFav = sql.NullFloat64{Float64: math.Max(pUp, pDown), Valid: true}
-	e.traceOpenTo("decide", time.Now().UTC())
+	e.traceOpenTo("decide", e.correctedTime(time.Now()).UTC())
 	e.mu.Lock()
 	e.lastQuote = q
 	e.mu.Unlock()
@@ -443,22 +579,15 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 	w.EntryLagMS = sql.NullFloat64{Float64: (w.DecisionTS - float64(ts)) * 1000, Valid: true}
 
-	if e.now().Sub(time.Unix(ts, 0).UTC()) >= e.Cfg.EntryMaxLag {
+	if _, _, latest, ok := e.entryElapsed(ts); !ok || latest >= e.Cfg.EntryMaxLag {
 		return e.finishSkip(ctx, w, "late", "late after quote")
 	}
 
-	if eq <= 0 || px <= 0 || time.Since(e.readyAt) > 20*time.Second {
-		tEq := time.Now()
-		var err error
-		eq, err = e.equity(ctx)
-		if err != nil {
-			return e.finishSkip(ctx, w, "equity", err.Error())
-		}
-		px, err = e.btcPx(ctx)
-		if err != nil || px <= 0 {
-			return e.finishSkip(ctx, w, "no_px", fmt.Sprintf("%v", err))
-		}
-		e.traceDur("equity", tEq)
+	e.mu.Lock()
+	readyOK, readyAt := e.readyOK, e.readyAt
+	e.mu.Unlock()
+	if !readyOK || eq <= 0 || px <= 0 || time.Since(readyAt) > 5*time.Second {
+		return e.finishSkip(ctx, w, "ready", "equity/price/flat state is not fresh from prewarm")
 	}
 	meta := e.Markets[e.Cfg.Symbol]
 	qty := strategy.FloorLot((eq*e.Cfg.EquityFraction*e.Cfg.Leverage)/px, meta.SizeDecimals)
@@ -494,10 +623,16 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return nil
 	}
 
+	if _, _, latest, ok := e.entryElapsed(ts); !ok || latest >= e.Cfg.EntryMaxLag {
+		return e.finishSkip(ctx, w, "late", "deadline expired before order request")
+	}
+	sendCtx, sendCancel := context.WithDeadline(ctx, deadline)
 	tSend := time.Now()
-	res, err := e.Signer.MarketIOC(e.Cfg.Symbol, buy, qty, px, e.Cfg.MarketSlippage, clientIdx, false)
+	e.traceOpenTo("send", e.correctedTime(tSend).UTC())
+	res, err := e.Signer.MarketIOC(sendCtx, e.Cfg.Symbol, buy, qty, px, e.Cfg.MarketSlippage, clientIdx, false)
+	sendCancel()
 	e.traceDur("send", tSend)
-	e.traceOpenTo("send", time.Now().UTC())
+	e.traceOpenTo("send_ack", e.correctedTime(time.Now()).UTC())
 	w.State = "sent"
 	e.saveWindow(ctx, w)
 	_ = e.Store.InsertOrder(ctx, ts, "entry", errString(err, "sent"), clientIdx, hashOf(res), qty, px, nil)
@@ -505,22 +640,48 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "order_failed", err.Error())
 	}
 
+	type positionResult struct {
+		position lighter.Position
+		open     bool
+		err      error
+	}
+	posCtx, posCancel := context.WithTimeout(ctx, 350*time.Millisecond)
+	posCh := make(chan positionResult, 1)
+	go func() {
+		acc, err := e.HTTP.AccountUrgent(posCtx, e.Cfg.AccountIndex)
+		if err != nil {
+			posCh <- positionResult{err: err}
+			return
+		}
+		p, open := acc.Position(e.Cfg.Symbol, meta.MarketID)
+		posCh <- positionResult{position: p, open: open}
+	}()
 	tFill := time.Now()
 	fillPx, fillQty, fee, fillUnix := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, px, 300*time.Millisecond)
 	e.traceDur("fill_wait", tFill)
+	tPos := time.Now()
+	select {
+	case pr := <-posCh:
+		if pr.err == nil && pr.open && pr.position.Size > 0 {
+			if pr.position.Size > qty+math.Pow10(-meta.SizeDecimals) {
+				posCancel()
+				_ = e.ensureFlat(ctx, "unexpected_entry_size")
+				e.halt(ctx, "unexpected_entry_size")
+				return e.finishSkip(ctx, w, "unexpected_entry_size", fmt.Sprintf("position %.8f exceeded requested %.8f", pr.position.Size, qty))
+			}
+			if fillQty <= 0 || pr.position.Size > fillQty {
+				fillQty = pr.position.Size
+			}
+			if pr.position.AvgEntry > 0 {
+				fillPx = pr.position.AvgEntry
+			}
+		}
+	case <-posCtx.Done():
+	}
+	posCancel()
+	e.traceDur("pos_check", tPos)
 	if fillPx <= 0 {
 		fillPx = px
-	}
-	if fillQty <= 0 {
-		tPos := time.Now()
-		if flat, p := e.isFlat(ctx); !flat && p.Size > 0 {
-			fillQty = p.Size
-			if p.AvgEntry > 0 {
-				fillPx = p.AvgEntry
-			}
-			e.Log.Info("fill from position", "qty", fillQty, "px", fillPx, "client", clientIdx)
-		}
-		e.traceDur("pos_check", tPos)
 	}
 	if fillQty <= 0 {
 		e.alert(ctx, "error", "entry", "ордер отправлен, филла нет — flatten")
@@ -547,7 +708,33 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 	fillTS := fillUnix
 	var fillLag sql.NullFloat64
-	octx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
+	stopPx := strategy.StopPx(fillPx, side, e.Cfg.StopPricePct)
+	stopIdx := int64(0)
+	if stopPx > 0 {
+		stopIdx = e.nextClientIdx(ctx)
+		tStop := time.Now()
+		sctx, scancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		stopResult, stopErr := e.Signer.StopLoss(sctx, e.Cfg.Symbol, side == strategy.SideLong, usedQty, stopPx, e.Cfg.ExitSlippage, stopIdx)
+		scancel()
+		e.traceDur("stop", tStop)
+		status := errString(stopErr, "sent")
+		_ = e.Store.InsertOrder(ctx, ts, "stop_loss", status, stopIdx, hashOf(stopResult), usedQty, stopPx, map[string]any{"trigger_price": stopPx, "reduce_only": true})
+		if stopErr != nil {
+			e.alert(ctx, "error", "stop_missing", fmt.Sprintf("не удалось поставить стоп %.2f после fill %.2f: %v; закрываю позицию", stopPx, fillPx, stopErr))
+			closeErr := e.ensureFlat(ctx, "stop_missing")
+			if cancelErr := e.Signer.CancelAll(ctx); cancelErr != nil {
+				e.Log.Warn("cancel orders after stop failure", "err", cancelErr)
+			}
+			e.halt(ctx, "stop_missing")
+			if closeErr != nil {
+				return fmt.Errorf("place stop: %w; emergency flatten: %v", stopErr, closeErr)
+			}
+			return e.finishSkip(ctx, w, "stop_missing", stopErr.Error())
+		}
+	}
+	// Query exchange creation time only after the protective stop has been
+	// submitted; telemetry must never delay risk protection.
+	octx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	tOrd := time.Now()
 	if o, err := e.HTTP.OrderByClient(octx, e.Cfg.AccountIndex, clientIdx); err == nil {
 		if u := o.CreatedUnix(); u > 0 {
@@ -559,28 +746,6 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	cancel()
 	if fillLag.Valid && e.tr != nil {
 		e.tr.t.MsOpenToExchange = fillLag.Float64
-	}
-	stopPx := strategy.StopPx(fillPx, side, e.Cfg.StopPricePct)
-	stopIdx := int64(0)
-	if stopPx > 0 {
-		stopIdx = e.nextClientIdx(ctx)
-		tStop := time.Now()
-		stopResult, stopErr := e.Signer.StopLoss(e.Cfg.Symbol, side == strategy.SideLong, usedQty, stopPx, e.Cfg.MarketSlippage, stopIdx)
-		e.traceDur("stop", tStop)
-		status := errString(stopErr, "sent")
-		_ = e.Store.InsertOrder(ctx, ts, "stop_loss", status, stopIdx, hashOf(stopResult), usedQty, stopPx, map[string]any{"trigger_price": stopPx, "reduce_only": true})
-		if stopErr != nil {
-			e.alert(ctx, "error", "stop_missing", fmt.Sprintf("не удалось поставить стоп %.2f после fill %.2f: %v; закрываю позицию", stopPx, fillPx, stopErr))
-			closeErr := e.ensureFlat(ctx, "stop_missing")
-			if cancelErr := e.Signer.CancelAll(); cancelErr != nil {
-				e.Log.Warn("cancel orders after stop failure", "err", cancelErr)
-			}
-			e.halt(ctx, "stop_missing")
-			if closeErr != nil {
-				return fmt.Errorf("place stop: %w; emergency flatten: %v", stopErr, closeErr)
-			}
-			return e.finishSkip(ctx, w, "stop_missing", stopErr.Error())
-		}
 	}
 	e.mu.Lock()
 	e.pos = &livePos{
@@ -625,7 +790,11 @@ func (e *Engine) finishSkip(ctx context.Context, w store.Window, reason, msg str
 	w.FillLagMS = sql.NullFloat64{}
 	e.stampClock(&w)
 	if w.DecisionTS == 0 {
-		w.DecisionTS = e.unix()
+		if now, ok := e.entryClock(); ok {
+			w.DecisionTS = float64(now.UnixNano()) / 1e9
+		} else {
+			w.DecisionTS = e.unix()
+		}
 	}
 	e.saveWindow(ctx, w)
 	e.mu.Lock()
@@ -668,7 +837,7 @@ func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string)
 		}
 	} else {
 		if pos.StopClientIdx > 0 && e.Signer != nil {
-			if err := e.Signer.CancelAll(); err != nil {
+			if err := e.Signer.CancelAll(ctx); err != nil {
 				e.Log.Warn("cancel stop before window close", "err", err)
 			}
 		}
@@ -770,7 +939,7 @@ func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64
 	}
 	buy := pos.Side == strategy.SideShort // closing short = buy
 	idx := e.nextClientIdx(ctx)
-	res, err := e.Signer.MarketIOC(e.Cfg.Symbol, buy, pos.Qty, ref, e.Cfg.MarketSlippage, idx, true)
+	res, err := e.Signer.MarketIOC(ctx, e.Cfg.Symbol, buy, pos.Qty, ref, e.Cfg.ExitSlippage, idx, true)
 	_ = e.Store.InsertOrder(ctx, pos.WindowTS, "exit", errString(err, "sent"), idx, hashOf(res), pos.Qty, ref, nil)
 	if err != nil {
 		return 0, 0, err
@@ -795,7 +964,7 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 		// Clear stale conditional orders once on boot, including the case where
 		// the previous process exited after the position was already closed.
 		if why == "boot" || why == "kill" {
-			if err := e.Signer.CancelAll(); err != nil {
+			if err := e.Signer.CancelAll(ctx); err != nil {
 				e.Log.Warn("cancel stale orders on boot", "err", err)
 			}
 		}
@@ -813,7 +982,7 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 		}
 		time.Sleep(200 * time.Millisecond)
 		if ok, _ := e.isFlat(ctx); ok {
-			if err := e.Signer.CancelAll(); err != nil {
+			if err := e.Signer.CancelAll(ctx); err != nil {
 				e.Log.Warn("cancel residual orders after flatten", "why", why, "err", err)
 			}
 			return nil

@@ -22,6 +22,14 @@ type Fill struct {
 }
 
 func (c *HTTPClient) AccountTrades(ctx context.Context, accountIndex int64, marketID uint16, limit int) ([]Fill, error) {
+	return c.accountTrades(ctx, accountIndex, marketID, limit, false)
+}
+
+func (c *HTTPClient) AccountTradesUrgent(ctx context.Context, accountIndex int64, marketID uint16, limit int) ([]Fill, error) {
+	return c.accountTrades(ctx, accountIndex, marketID, limit, true)
+}
+
+func (c *HTTPClient) accountTrades(ctx context.Context, accountIndex int64, marketID uint16, limit int, urgent bool) ([]Fill, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -34,7 +42,13 @@ func (c *HTTPClient) AccountTrades(ctx context.Context, accountIndex int64, mark
 	q.Set("sort_dir", "desc")
 	q.Set("limit", strconv.Itoa(limit))
 	q.Set("market_id", strconv.Itoa(int(marketID)))
-	b, err := c.get(ctx, "/api/v1/trades", q, true)
+	var b []byte
+	var err error
+	if urgent {
+		b, err = c.getUrgent(ctx, "/api/v1/trades", q, true)
+	} else {
+		b, err = c.get(ctx, "/api/v1/trades", q, true)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -225,9 +239,11 @@ func (c *HTTPClient) WaitFillFor(ctx context.Context, accountIndex int64, market
 	if budget <= 0 {
 		budget = 800 * time.Millisecond
 	}
+	fillCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 	deadline := time.Now().Add(budget)
 	for {
-		fills, err := c.AccountTrades(ctx, accountIndex, marketID, 100)
+		fills, err := c.AccountTradesUrgent(fillCtx, accountIndex, marketID, 100)
 		if err == nil {
 			subset := FillsForClient(fills, clientIdx)
 			if p, q, f, u := VWAP(subset); p > 0 {
@@ -238,7 +254,7 @@ func (c *HTTPClient) WaitFillFor(ctx context.Context, accountIndex int64, market
 			return fallback, 0, 0, 0
 		}
 		select {
-		case <-ctx.Done():
+		case <-fillCtx.Done():
 			return fallback, 0, 0, 0
 		case <-time.After(80 * time.Millisecond):
 		}

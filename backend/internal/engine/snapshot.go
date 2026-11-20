@@ -21,6 +21,7 @@ type Snapshot struct {
 	ClockOffsetMS  float64        `json:"clock_offset_ms"`
 	ClockOK        bool           `json:"clock_ok"`
 	ClockRTTMS     float64        `json:"clock_rtt_ms"`
+	ClockAgeMS     float64        `json:"clock_age_ms"`
 	HostUnix       float64        `json:"host_unix"`
 	SyncedUnix     float64        `json:"synced_unix"`
 	SecsIntoWindow float64        `json:"secs_into_window"`
@@ -55,14 +56,24 @@ func (e *Engine) Snapshot(ctx context.Context) Snapshot {
 	e.mu.Lock()
 	host := time.Now().UTC()
 	synced := host.Add(e.offset)
+	clockAge := time.Duration(0)
+	clockOK := e.offsetOK && !e.offsetAt.IsZero()
+	if clockOK {
+		clockAge = time.Since(e.offsetAt)
+		clockOK = clockAge <= 2*time.Minute
+	}
+	if !clockOK {
+		synced = host
+	}
 	ts := clock.WindowOf(host)
 	into := float64(host.Unix()) - float64(ts)
 	sn := Snapshot{
 		Profile: e.Cfg.Profile, InstanceID: e.Cfg.InstanceID, InstanceName: e.Cfg.InstanceName,
 		Network: string(e.Cfg.Network), DryRun: e.Cfg.DryRun, State: e.state,
 		KillSwitch: e.global.KillSwitch, Halted: e.global.Halted, HaltReason: e.global.HaltReason,
-		ClockOffsetMS: e.offset.Seconds() * 1000, ClockOK: e.offsetOK, ClockRTTMS: e.clockRTT.Seconds() * 1000,
-		HostUnix: float64(host.UnixNano()) / 1e9, SyncedUnix: float64(synced.UnixNano()) / 1e9,
+		ClockOffsetMS: e.offset.Seconds() * 1000, ClockOK: clockOK, ClockRTTMS: e.clockRTT.Seconds() * 1000,
+		ClockAgeMS: float64(clockAge.Milliseconds()),
+		HostUnix:   float64(host.UnixNano()) / 1e9, SyncedUnix: float64(synced.UnixNano()) / 1e9,
 		SecsIntoWindow: into, SecsToClose: 300 - into,
 		WindowTS: ts, NextTS: ts + 300,
 		PUp: e.lastQuote.MidUp(), PDown: 1 - e.lastQuote.MidUp(), Spread: e.lastQuote.Spread(),
@@ -71,6 +82,9 @@ func (e *Engine) Snapshot(ctx context.Context) Snapshot {
 		Symbol: e.Cfg.Symbol, Threshold: e.Cfg.Threshold, Leverage: e.Cfg.Leverage,
 		EquityFrac: e.Cfg.EquityFraction, StopPricePct: e.Cfg.StopPricePct, Position: "flat",
 		LastTimings: e.lastTimings,
+	}
+	if e.lastQuote.HasDown && e.lastQuote.BidDown > 0 && e.lastQuote.AskDown > 0 {
+		sn.PDown = (e.lastQuote.BidDown + e.lastQuote.AskDown) / 2
 	}
 	if !e.lastQuote.Recv.IsZero() {
 		sn.QuoteAgeMS = float64(host.Sub(e.lastQuote.Recv).Milliseconds())

@@ -24,6 +24,7 @@ type Timings struct {
 	MsOpenToQuote    float64 `json:"ms_open_to_quote,omitempty"`
 	MsOpenToDecide   float64 `json:"ms_open_to_decide,omitempty"`
 	MsOpenToSend     float64 `json:"ms_open_to_send,omitempty"`
+	MsOpenToSendAck  float64 `json:"ms_open_to_send_ack,omitempty"`
 	MsOpenToExchange float64 `json:"ms_open_to_exchange,omitempty"`
 	MsSendToExchange float64 `json:"ms_send_to_exchange,omitempty"`
 

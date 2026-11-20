@@ -16,11 +16,11 @@ import (
 )
 
 type HTTPClient struct {
-	BaseURL   string
-	HTTP      *http.Client
-	AuthToken string
-	mu        sync.Mutex
-	tokenFn   func(context.Context) (string, error)
+	BaseURL     string
+	HTTP        *http.Client
+	AuthToken   string
+	mu          sync.Mutex
+	tokenFn     func(context.Context) (string, error)
 	minInterval time.Duration
 	lastReq     time.Time
 	rateMu      sync.Mutex
@@ -318,10 +318,26 @@ type Position struct {
 }
 
 func (c *HTTPClient) Account(ctx context.Context, accountIndex int64) (*Account, error) {
+	return c.account(ctx, accountIndex, false)
+}
+
+// AccountUrgent skips the background polling pacer and is reserved for order
+// safety paths (fill detection / emergency position checks).
+func (c *HTTPClient) AccountUrgent(ctx context.Context, accountIndex int64) (*Account, error) {
+	return c.account(ctx, accountIndex, true)
+}
+
+func (c *HTTPClient) account(ctx context.Context, accountIndex int64, urgent bool) (*Account, error) {
 	q := url.Values{}
 	q.Set("by", "index")
 	q.Set("value", strconv.FormatInt(accountIndex, 10))
-	b, err := c.get(ctx, "/api/v1/account", q, false)
+	var b []byte
+	var err error
+	if urgent {
+		b, err = c.getUrgent(ctx, "/api/v1/account", q, false)
+	} else {
+		b, err = c.get(ctx, "/api/v1/account", q, false)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -436,10 +452,14 @@ func (c *HTTPClient) GetApiKey(accountIndex int64, apiKeyIndex uint8) (string, e
 func (c *HTTPClient) InvalidateApiKeys(accountIndex int64) {}
 
 func (c *HTTPClient) GetNextNonce(accountIndex int64, apiKeyIndex uint8) (int64, error) {
+	return c.GetNextNonceContext(context.Background(), accountIndex, apiKeyIndex)
+}
+
+func (c *HTTPClient) GetNextNonceContext(ctx context.Context, accountIndex int64, apiKeyIndex uint8) (int64, error) {
 	q := url.Values{}
 	q.Set("account_index", strconv.FormatInt(accountIndex, 10))
 	q.Set("api_key_index", strconv.Itoa(int(apiKeyIndex)))
-	nctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	nctx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
 	defer cancel()
 	b, err := c.getUrgent(nctx, "/api/v1/nextNonce", q, false)
 	if err != nil {

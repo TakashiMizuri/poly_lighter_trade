@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -36,6 +37,7 @@ type Config struct {
 	Leverage        float64
 	EquityFraction  float64
 	MarketSlippage  float64
+	ExitSlippage    float64
 	StopPricePct    float64
 	ShadowBinance1s bool
 
@@ -86,7 +88,8 @@ func Load() (*Config, error) {
 		ExitEarly:             time.Duration(getenvFloat("EXIT_EARLY_SECONDS", 0.30) * float64(time.Second)),
 		Leverage:              getenvFloat("LIGHTER_LEVERAGE", 1),
 		EquityFraction:        getenvFloat("LIGHTER_EQUITY_FRACTION", 1.0),
-		MarketSlippage:        getenvFloat("MARKET_SLIPPAGE", 0.02),
+		MarketSlippage:        getenvFloat("MARKET_SLIPPAGE", 0.0005),
+		ExitSlippage:          getenvFloat("EXIT_MARKET_SLIPPAGE", 0.02),
 		StopPricePct:          getenvFloat("STOP_PRICE_PCT", 0.00125),
 		ShadowBinance1s:       getenvBool("SHADOW_BINANCE_1S", true),
 		HaltExitLateStreak:    getenvInt("HALT_ON_EXIT_LATE_STREAK", 3),
@@ -116,6 +119,9 @@ func Load() (*Config, error) {
 	if cfg.InstanceName == "" {
 		cfg.InstanceName = cfg.Profile
 	}
+	if cfg.Profile != "POLY_LIGHTER_1" {
+		return nil, fmt.Errorf("unsupported POLY_LIGHTER_PROFILE %q (only POLY_LIGHTER_1 is implemented)", cfg.Profile)
+	}
 	switch net {
 	case NetworkMainnet:
 		cfg.BaseURL = getenv("LIGHTER_API_URL", "https://mainnet.zklighter.elliot.ai")
@@ -138,20 +144,44 @@ func Load() (*Config, error) {
 	if cfg.Symbol == "" {
 		return nil, fmt.Errorf("LIGHTER_SYMBOL is empty")
 	}
-	if cfg.Threshold <= 0.5 || cfg.Threshold >= 1 {
+	if !finite(cfg.Threshold) || cfg.Threshold <= 0.5 || cfg.Threshold >= 1 {
 		return nil, fmt.Errorf("PM_THRESHOLD must be in (0.5, 1)")
 	}
-	if cfg.Leverage <= 0 || cfg.Leverage > 50 {
-		return nil, fmt.Errorf("LIGHTER_LEVERAGE must be in (0, 50]")
+	if cfg.Symbol != "BTC" {
+		return nil, fmt.Errorf("POLY_LIGHTER_1 trades BTC only (LIGHTER_SYMBOL must be BTC)")
 	}
-	if cfg.EquityFraction <= 0 || cfg.EquityFraction > 1 {
-		return nil, fmt.Errorf("LIGHTER_EQUITY_FRACTION must be in (0, 1]")
+	if math.Abs(cfg.Threshold-0.65) > 1e-9 {
+		return nil, fmt.Errorf("POLY_LIGHTER_1 requires PM_THRESHOLD=0.65")
 	}
-	if cfg.StopPricePct <= 0 || cfg.StopPricePct > 0.05 {
+	if !finite(cfg.MaxSpread) || math.Abs(cfg.MaxSpread-0.05) > 1e-9 {
+		return nil, fmt.Errorf("POLY_LIGHTER_1 requires PM_MAX_SPREAD=0.05")
+	}
+	if cfg.PMSeriesSlug != "btc-updown-5m" {
+		return nil, fmt.Errorf("POLY_LIGHTER_1 requires PM_SERIES_SLUG=btc-updown-5m")
+	}
+	if !finite(cfg.Leverage) || math.Abs(cfg.Leverage-1) > 1e-9 {
+		return nil, fmt.Errorf("POLY_LIGHTER_1 requires LIGHTER_LEVERAGE=1")
+	}
+	if !finite(cfg.EquityFraction) || math.Abs(cfg.EquityFraction-1) > 1e-9 {
+		return nil, fmt.Errorf("POLY_LIGHTER_1 requires LIGHTER_EQUITY_FRACTION=1")
+	}
+	if cfg.EntryMaxLag <= 0 || cfg.EntryMaxLag > 2*time.Second {
+		return nil, fmt.Errorf("ENTRY_MAX_LAG_SECONDS must be in (0, 2] for POLY_LIGHTER_1")
+	}
+	if cfg.ExitEarly <= 0 || cfg.ExitEarly > 2*time.Second {
+		return nil, fmt.Errorf("EXIT_EARLY_SECONDS must be in (0, 2]")
+	}
+	if !finite(cfg.StopPricePct) || cfg.StopPricePct <= 0 || cfg.StopPricePct > 0.05 {
 		return nil, fmt.Errorf("STOP_PRICE_PCT must be in (0, 0.05] (default 0.00125 = 0.125%% of BTC price)")
 	}
-	if cfg.PrewarmSeconds < 5 {
-		cfg.PrewarmSeconds = 15
+	if !finite(cfg.MarketSlippage) || cfg.MarketSlippage <= 0 || cfg.MarketSlippage > 0.01 {
+		return nil, fmt.Errorf("MARKET_SLIPPAGE must be in (0, 0.01]")
+	}
+	if !finite(cfg.ExitSlippage) || cfg.ExitSlippage <= 0 || cfg.ExitSlippage > 0.05 {
+		return nil, fmt.Errorf("EXIT_MARKET_SLIPPAGE must be in (0, 0.05]")
+	}
+	if !finite(cfg.PrewarmSeconds) || cfg.PrewarmSeconds < 15 || cfg.PrewarmSeconds > 120 {
+		return nil, fmt.Errorf("PM_PREWARM_SECONDS must be in [15, 120] for POLY_LIGHTER_1")
 	}
 	return cfg, nil
 }
@@ -190,6 +220,8 @@ func getenvFloat(k string, def float64) float64 {
 	}
 	return def
 }
+
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 func getenvBool(k string, def bool) bool {
 	if v := strings.TrimSpace(os.Getenv(k)); v != "" {

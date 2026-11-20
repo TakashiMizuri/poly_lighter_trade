@@ -49,7 +49,7 @@ function isTrade(w: WindowRow) {
   return w.side === "long" || w.side === "short";
 }
 
-/** Лаг только у входов: open 5m UTC → timestamp ордера/fill на Lighter. */
+/** Лаг только у входов: open 5m UTC → биржевой created_at ордера Lighter. */
 function tradeLag(w: WindowRow): number | null {
   if (!isTrade(w) || num(w.lighter_entry_px) == null) return null;
   return num(w.fill_lag_ms);
@@ -59,6 +59,8 @@ const TIMING_STEPS: { key: keyof WindowTimings; label: string }[] = [
   { key: "ms_late_start", label: "опоздание к :00" },
   { key: "ms_quote", label: "1. цена PM" },
   { key: "ms_send", label: "2. отправка IOC" },
+  { key: "ms_open_to_send", label: "начало запроса от :00" },
+  { key: "ms_open_to_send_ack", label: "ответ sendTx от :00" },
   { key: "ms_fill_wait", label: "fill" },
   { key: "ms_order_get", label: "timestamp ордера" },
   { key: "ms_arm", label: "resolve рынка PM" },
@@ -87,7 +89,7 @@ function TimingsView({ t, compact }: { t?: WindowTimings | null; compact?: boole
   if (compact) {
     const bits = rows.map((s) => `${s.label} ${s.v!.toFixed(0)}`);
     if (t.ms_open_to_decide) bits.unshift(`решение ${t.ms_open_to_decide.toFixed(0)}`);
-    if (t.ms_open_to_send) bits.push(`send ${t.ms_open_to_send.toFixed(0)}`);
+    if (t.ms_open_to_send) bits.push(`запрос ${t.ms_open_to_send.toFixed(0)}`);
     return <span className="text-[11px] leading-snug">{bits.join(" · ")}</span>;
   }
   return (
@@ -206,7 +208,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
   }
 
   const halted = Boolean(status?.kill_switch || status?.halted);
-  const clockBad = Boolean(status && status.clock_ok && Math.abs(status.clock_offset_ms) > 1000);
+  const clockBad = Boolean(status && (!status.clock_ok || Math.abs(status.clock_offset_ms) > 1000));
   const skipMix = useMemo(() => {
     const m = new Map<string, number>();
     for (const w of windows) {
@@ -332,7 +334,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <Stat label="Equity Lighter" value={`$${fmt(status.equity)}`} hint="Живой счёт" />
               <Stat label="Пик / тень Binance" value={`$${fmt(status.peak_equity)} / $${fmt(status.shadow_equity)}`} hint="Тень — research T+1s, не Lighter" />
-              <Stat label="Сделки / skip" value={`${stats?.n_trades ?? 0} / ${stats?.n_skip ?? 0}`} hint={`окон ${stats?.n_windows ?? 0} · покрытие котировкой ${fmt((stats?.coverage ?? 0) * 100, 1)}%`} />
+              <Stat label="Сделки / skip" value={`${stats?.n_trades ?? 0} / ${stats?.n_skip ?? 0}`} hint={`окон ${stats?.n_windows ?? 0} · валидная котировка ≤1с: ${fmt((stats?.coverage ?? 0) * 100, 1)}%`} />
               <Stat label="WR live" value={`${fmt((stats?.wr ?? 0) * 100, 1)}%`} hint={`mean ${fmt(stats?.mean_bps, 1)} bps · SL ${stats?.n_sl ?? 0}`} />
               <Stat label="Тень mean bps" value={fmt(stats?.shadow_mean_bps, 1)} hint="Binance 1s T+1 → 5m close" />
               <Stat label="gap live − тень" value={fmt(stats?.gap_bps, 1)} hint={stats?.match_coef == null ? "мало пар" : `live/тень ${fmt(stats.match_coef, 2)}`} />
@@ -515,8 +517,8 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
             <Alert variant={clockBad ? "destructive" : "default"}>
               <AlertTitle>Сетка окон = UTC. Лаг входа — это не эти часы.</AlertTitle>
               <AlertDescription>
-                Binance time только проверяет, что VPS не уехал от UTC (slug btc-updown-5m-ts). Лаг сделки считается отдельно:
-                время ордера на Lighter минус open окна.
+                Host time не переставляется. Свежий offset Binance используется для планирования границы и T+2;
+                без свежего замера или при расхождении &gt;1 с вход запрещён. Лаг сделки отдельно считается по created_at ордера Lighter.
               </AlertDescription>
             </Alert>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -526,7 +528,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                 hint="Плюс = Binance впереди VPS"
               />
               <Stat label="RTT замера" value={ms(status.clock_rtt_ms)} hint=">800 ms — сеть, замер выкидывается" />
-              <Stat label="замер доверенный" value={status.clock_ok ? "да" : "нет"} />
+              <Stat label="замер доверенный" value={status.clock_ok ? `да · ${ms(status.clock_age_ms)} назад` : "нет / устарел"} />
               <Stat label="дедлайн входа" value="T+2.0 с" hint="Если к ts+2 нет ордера — skip late" />
             </div>
           </TabsContent>

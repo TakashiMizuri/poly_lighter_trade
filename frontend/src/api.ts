@@ -17,6 +17,7 @@ export type WindowTimings = {
   ms_open_to_quote?: number;
   ms_open_to_decide?: number;
   ms_open_to_send?: number;
+  ms_open_to_send_ack?: number;
   ms_open_to_exchange?: number;
   ms_send_to_exchange?: number;
   quote_source?: string;
@@ -35,6 +36,7 @@ export type Status = {
   clock_offset_ms: number;
   clock_ok: boolean;
   clock_rtt_ms: number;
+  clock_age_ms: number;
   host_unix: number;
   synced_unix: number;
   secs_into_window: number;
