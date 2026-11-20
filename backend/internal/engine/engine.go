@@ -685,8 +685,15 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 	if fillQty <= 0 {
 		e.alert(ctx, "error", "entry", "ордер отправлен, филла нет — flatten")
-		if err := e.ensureFlat(ctx, "entry_unfilled"); err != nil {
-			e.Log.Warn("flatten after unfilled", "err", err)
+		flattenErr := e.ensureFlat(ctx, "entry_unfilled")
+		if flattenErr != nil {
+			e.Log.Error("flatten after unconfirmed entry failed", "err", flattenErr)
+			e.alert(ctx, "error", "entry_unconfirmed", "не подтверждённый вход; аварийное закрытие не подтверждено, HALT")
+		} else if err := e.Signer.CancelAll(ctx); err != nil {
+			// Only cancel after flat has been confirmed. If flatten failed, retain
+			// any protective reduce-only order while the bot is halted.
+			e.Log.Error("cancel orders after unconfirmed entry failed", "err", err)
+			e.alert(ctx, "error", "entry_unconfirmed", "позиция проверена flat, но отмена остаточных ордеров не подтверждена; HALT")
 		}
 		w.SkipReason = "entry_unfilled_after_send"
 		w.Side = strategy.SideSkip
@@ -694,11 +701,11 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		w.FillLagMS = sql.NullFloat64{}
 		e.stampClock(&w)
 		e.bumpLateStreak(ctx, true)
+		// A sent entry with no confirmed fill is an ambiguous exchange state.
+		// Stop all future entries even if the immediate position query said flat.
+		e.halt(ctx, "entry_unconfirmed")
 		e.saveWindow(ctx, w)
 		e.flogWindow("skip", w)
-		if e.global.LateStreak >= e.Cfg.HaltExitLateStreak {
-			e.halt(ctx, "entry_unfilled_streak")
-		}
 		return e.sleepToExit(ctx, ts)
 	}
 	e.bumpLateStreak(ctx, false)
