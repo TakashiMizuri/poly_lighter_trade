@@ -67,8 +67,8 @@ func (c *HTTPClient) AccountTrades(ctx context.Context, accountIndex int64, mark
 			Fee:       takerFeeUSD(m),
 			Timestamp: int64(intField(m, "timestamp")),
 			TxHash:    strField(m, "tx_hash"),
-			AskClient: int64(intField(m, "ask_client_id")),
-			BidClient: int64(intField(m, "bid_client_id")),
+			AskClient: int64(intField(m, "ask_client_id", "ask_client_order_index", "ask_client_order_id", "client_order_index")),
+			BidClient: int64(intField(m, "bid_client_id", "bid_client_order_index", "bid_client_order_id")),
 		})
 	}
 	return out, nil

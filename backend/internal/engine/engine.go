@@ -423,16 +423,36 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		// sent but past deadline — still honor fill if any; do not chase more
 	}
 
-	fillPx, fillQty, fee := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, px, 300*time.Millisecond)
+	fillPx, fillQty, fee := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, px, 2*time.Second)
 	if fillPx <= 0 {
 		fillPx = px
 	}
 	if fillQty <= 0 {
-		// unfilled after send
+		// trades feed often omits client_order_id; position is the source of truth
+		until := time.Now().Add(1500 * time.Millisecond)
+		for time.Now().Before(until) {
+			flat, p := e.isFlat(ctx)
+			if !flat && p.Size > 0 {
+				fillQty = p.Size
+				if p.AvgEntry > 0 {
+					fillPx = p.AvgEntry
+				}
+				e.Log.Info("fill from position", "qty", fillQty, "px", fillPx, "client", clientIdx)
+				break
+			}
+			time.Sleep(120 * time.Millisecond)
+		}
+	}
+	if fillQty <= 0 {
+		e.alert(ctx, "error", "entry", "ордер отправлен, филла нет — flatten")
+		if err := e.ensureFlat(ctx, "entry_unfilled"); err != nil {
+			e.Log.Warn("flatten after unfilled", "err", err)
+		}
 		w.SkipReason = "entry_unfilled_after_send"
 		w.Side = strategy.SideSkip
+		w.ExitReason = "skip"
+		e.stampClock(&w)
 		e.bumpLateStreak(ctx, true)
-		e.alert(ctx, "error", "entry", "ордер отправлен, филла нет")
 		_ = e.Store.UpdateWindow(ctx, w)
 		e.flogWindow("skip", w)
 		if e.global.LateStreak >= e.Cfg.HaltExitLateStreak {
