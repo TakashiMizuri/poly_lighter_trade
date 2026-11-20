@@ -36,7 +36,7 @@ ss -lptn | grep -E ':80|:443|:8081'
 # :8081 должен быть свободен
 ```
 
-Нужны: Docker Engine + Compose plugin, git, ufw, chrony/NTP (бот гейтит вход, если clock offset > 1s).
+Нужны: Docker Engine + Compose plugin, git, ufw, chrony/NTP. Бот использует системные UTC-часы VPS; Binance time — только диагностический ориентир и не блокирует вход.
 
 Если Docker ещё не ставили (чистый сервер — маловероятно рядом с Donchian):
 
@@ -51,7 +51,7 @@ docker compose version
 
 ```bash
 timedatectl
-# NTP synchronized: yes
+# NTP synchronized: yes (обязательно)
 # Time zone лучше UTC (как у Donchian)
 
 # если есть тот же helper, что у Donchian:
@@ -524,7 +524,7 @@ npm run dev
 | Порт занят / web не мапится | Donchian на 80; этот бот только 8081; не `--profile tls` рядом с Caddy Donchian |
 | Telegram `409 Conflict` | тот же token, что у Donchian, или второй контейнер |
 | Дашборд 401 после HTTPS | `COOKIE_SECURE=true`, заход по `https://` |
-| Вечный skip `clock` | вкладка **Часы**: offset Binance−host и RTT. Хост: `chronyc tracking` (не helper `date -s`). RTT > 800 ms — не часы, сеть. Lighter тут ни при чём |
+| Ошибка времени / неверные UTC-границы | вкладка **Часы** — диагностический offset Binance; на VPS проверь `chronyc tracking` и `chronyc sources -v`. Должны быть `Leap status: Normal` и выбранный источник `^*`. Binance API таймаут сам по себе вход не блокирует |
 | skip `no_market` | slug `btc-updown-5m-{ts}`, Gamma 404 — окно без рынка, не подставлять соседнее |
 | skip `below_th` | **норма**, большинство окон |
 | `sendTx` / nonce | второй процесс с тем же api_key_index; один бот на ключ |

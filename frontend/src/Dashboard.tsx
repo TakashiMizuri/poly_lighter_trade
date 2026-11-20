@@ -239,7 +239,6 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
   }
 
   const halted = Boolean(status?.kill_switch || status?.halted);
-  const clockBad = Boolean(status && (!status.clock_ok || Math.abs(status.clock_offset_ms) > 1000));
   const skipMix = useMemo(() => {
     const m = new Map<string, number>();
     for (const w of windows) {
@@ -484,7 +483,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                 Resume
               </Button>
               <span className="text-xs text-muted-foreground">
-                Три площадки: PM = сигнал, Lighter = сделки, Binance = UTC и тень research.
+                PM = сигнал, Lighter = сделки, Binance = время для справки и research-тень.
               </span>
             </div>
           </TabsContent>
@@ -547,22 +546,22 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
           </TabsContent>
 
           <TabsContent value="clock" className="space-y-3 p-4">
-            <Alert variant={clockBad ? "destructive" : "default"}>
-              <AlertTitle>Сетка окон = UTC. Лаг входа — это не эти часы.</AlertTitle>
+            <Alert>
+              <AlertTitle>Расписание и дедлайн входа используют системный UTC хоста.</AlertTitle>
               <AlertDescription>
-                Host time не переставляется. Свежий offset Binance используется для планирования границы и T+2;
-                без свежего замера или при расхождении &gt;1 с вход запрещён. Лаг сделки отдельно считается по created_at ордера Lighter.
+                Синхронизацию системных часов обеспечивает chrony/NTP на VPS. Замер Binance — только диагностика:
+                его таймаут или отсутствие свежего значения не блокирует вход. Лаг сделки отдельно считается по created_at ордера Lighter.
               </AlertDescription>
             </Alert>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <Stat
-                label="offset Binance − host"
+                label="диагностический offset Binance − host"
                 value={status.clock_ok ? signedMs(status.clock_offset_ms) : "нет замера"}
-                hint="Плюс = Binance впереди VPS"
+                hint="Плюс = Binance впереди VPS; не управляет входом"
               />
               <Stat label="RTT замера" value={ms(status.clock_rtt_ms)} hint=">800 ms — сеть, замер выкидывается" />
               <Stat label="замер доверенный" value={status.clock_ok ? `да · ${ms(status.clock_age_ms)} назад` : "нет / устарел"} />
-              <Stat label="дедлайн входа" value="T+2.0 с" hint="Если к ts+2 нет ордера — skip late" />
+              <Stat label="дедлайн входа" value="T+2.0 с" hint="По системному UTC VPS; после ts+2 — skip late" />
             </div>
           </TabsContent>
 

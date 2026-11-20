@@ -97,67 +97,26 @@ func New(cfg *config.Config, st *store.Store, httpClient *lighter.HTTPClient, si
 }
 
 func (e *Engine) now() time.Time {
-	// Window scheduling follows the host's UTC clock; Binance offset is used to
-	// validate the real entry deadline, not to step or silently shift the host.
+	// The VPS system clock is disciplined by chrony/NTP. Binance time is
+	// telemetry only and must not become a runtime dependency for trading.
 	return time.Now().UTC()
 }
 
-func (e *Engine) entryClock() (time.Time, bool) {
-	e.mu.Lock()
-	off, ok, measured := e.offset, e.offsetOK, e.offsetAt
-	e.mu.Unlock()
-	if !ok || measured.IsZero() || time.Since(measured) > 2*time.Minute {
-		return time.Time{}, false
-	}
-	return time.Now().Add(off), true
+func (e *Engine) entryClock() time.Time {
+	return e.now()
 }
 
-func (e *Engine) clockOffset() (time.Duration, bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if !e.offsetOK || e.offsetAt.IsZero() || time.Since(e.offsetAt) > 2*time.Minute {
-		return 0, false
-	}
-	return e.offset, true
+func (e *Engine) entryDeadline(ts int64) time.Time {
+	return time.Unix(ts, 0).UTC().Add(e.Cfg.EntryMaxLag)
 }
 
-func (e *Engine) clockSample() (offset, rtt time.Duration, ok bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if !e.offsetOK || e.offsetAt.IsZero() || time.Since(e.offsetAt) > 2*time.Minute {
-		return 0, 0, false
-	}
-	return e.offset, e.clockRTT, true
-}
-
-func (e *Engine) entryDeadline(ts int64) (time.Time, bool) {
-	e.mu.Lock()
-	off, rtt, ok := e.offset, e.clockRTT, e.offsetOK
-	measured := e.offsetAt
-	e.mu.Unlock()
-	if !ok || measured.IsZero() || time.Since(measured) > 2*time.Minute {
-		return time.Time{}, false
-	}
-	return time.Unix(ts, 0).Add(e.Cfg.EntryMaxLag).Add(-off - rtt/2), true
-}
-
-func (e *Engine) entryElapsed(ts int64) (mid, lower, upper time.Duration, ok bool) {
-	off, rtt, ok := e.clockSample()
-	if !ok {
-		return 0, 0, 0, false
-	}
-	mid = time.Now().Add(off).Sub(time.Unix(ts, 0).UTC())
-	return mid, mid - rtt/2, mid + rtt/2, true
+func (e *Engine) entryElapsed(ts int64) (mid, lower, upper time.Duration) {
+	mid = e.now().Sub(time.Unix(ts, 0).UTC())
+	return mid, mid, mid
 }
 
 func (e *Engine) correctedTime(local time.Time) time.Time {
-	e.mu.Lock()
-	off, ok := e.offset, e.offsetOK
-	e.mu.Unlock()
-	if ok {
-		return local.Add(off)
-	}
-	return local
+	return local.UTC()
 }
 
 func (e *Engine) unix() float64 {
@@ -204,7 +163,7 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	e.alert(ctx, "info", "boot", fmt.Sprintf("POLY_LIGHTER_1 онлайн · %s · lev=%.1fx · frac=%.2f · equity=%.2f", e.Cfg.Network, e.Cfg.Leverage, e.Cfg.EquityFraction, eq))
 	go func() {
 		if err := e.syncClock(context.Background(), 3); err != nil {
-			e.Log.Warn("boot clock (telemetry only)", "err", err)
+			e.Log.Debug("binance clock telemetry unavailable", "err", err)
 		}
 	}()
 	return nil
@@ -288,19 +247,19 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 		}
 	}
 	if e.now().Before(serverOpen.Add(-3 * time.Second)) {
-		if err := e.syncClock(ctx, 3); err != nil {
-			e.Log.Warn("prewarm clock", "err", err)
-		} else if off, ok := e.clockOffset(); ok && absDur(off) > e.Cfg.ClockAlertOffset {
-			e.alert(ctx, "warn", "clock", fmt.Sprintf("offset=%s", off))
-		}
+		// Binance remains a best-effort reference for the dashboard. Never wait
+		// on it while scheduling or preparing a live entry.
+		go func() {
+			cctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+			defer cancel()
+			if err := e.syncClock(cctx, 3); err != nil {
+				e.Log.Debug("binance clock telemetry unavailable", "err", err)
+			}
+		}()
 	}
-	// Convert the exchange's UTC boundary to the host's wall clock using the
-	// measured server offset. This corrects both early and late wake-ups.
+	// Chrony/NTP disciplines the host's system UTC clock. Binance API time is
+	// not used to move the boundary or determine the entry deadline.
 	scheduleOpen := serverOpen
-	if off, rtt, ok := e.clockSample(); ok {
-		// Wait until even the earliest plausible server time has reached :00.
-		scheduleOpen = serverOpen.Add(-off + rtt/2)
-	}
 	prewarm := scheduleOpen.Add(-time.Duration(e.Cfg.PrewarmSeconds * float64(time.Second)))
 	if e.now().Before(prewarm) {
 		if err := clock.SleepUntil(ctx, prewarm, e.now); err != nil {
@@ -491,15 +450,9 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "halt", "halted")
 	}
 
-	_, earliest, latest, clockOK := e.entryElapsed(ts)
-	if !clockOK {
-		return e.finishSkip(ctx, w, "clock", "no recent trusted Binance time sample")
-	}
+	_, earliest, latest := e.entryElapsed(ts)
 	if earliest < 0 {
-		return e.finishSkip(ctx, w, "clock", "clock uncertainty places decision before window open")
-	}
-	if off, ok := e.clockOffset(); !ok || absDur(off) > e.Cfg.ClockSkipOffset {
-		return e.finishSkip(ctx, w, "clock", "clock offset unavailable or > 1s")
+		return e.finishSkip(ctx, w, "clock", "system UTC is still before window open")
 	}
 	if latest >= e.Cfg.EntryMaxLag {
 		return e.finishSkip(ctx, w, "late", "past T+2s")
@@ -524,20 +477,16 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "no_market", "empty tokens")
 	}
 
-	deadline, deadlineOK := e.entryDeadline(ts)
-	if !deadlineOK {
-		return e.finishSkip(ctx, w, "clock", "entry deadline unavailable")
-	}
+	deadline := e.entryDeadline(ts)
 	qctx, qcancel := context.WithDeadline(ctx, deadline)
 	tQ := time.Now()
 	q, err := e.PM.SnapshotUp(qctx, mkt, e.now(), time.Second)
 	qcancel()
 	e.traceDur("quote", tQ)
-	if elapsed, _, _, ok := e.entryElapsed(ts); ok {
-		e.traceOpenTo("quote", time.Unix(ts, 0).Add(elapsed))
-	}
+	elapsed, _, _ := e.entryElapsed(ts)
+	e.traceOpenTo("quote", time.Unix(ts, 0).Add(elapsed))
 	if err != nil {
-		if _, _, latest, ok := e.entryElapsed(ts); ok && latest >= e.Cfg.EntryMaxLag {
+		if _, _, latest := e.entryElapsed(ts); latest >= e.Cfg.EntryMaxLag {
 			return e.finishSkip(ctx, w, "late", "quote unavailable before T+2s: "+err.Error())
 		}
 		return e.finishSkip(ctx, w, "bad_quote", err.Error())
@@ -555,11 +504,8 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		pDown = (q.BidDown + q.AskDown) / 2
 	}
 	side, skipReason, both := strategy.DecideSide(pUp, e.Cfg.Threshold)
-	if decisionTime, ok := e.entryClock(); ok {
-		w.DecisionTS = float64(decisionTime.UnixNano()) / 1e9
-	} else {
-		return e.finishSkip(ctx, w, "clock", "clock sample expired during decision")
-	}
+	decisionTime := e.entryClock()
+	w.DecisionTS = float64(decisionTime.UnixNano()) / 1e9
 	quoteTime := e.correctedTime(q.Recv)
 	w.QuoteTS = float64(quoteTime.UnixNano()) / 1e9
 	w.PUp, w.PDown, w.Spread = pUp, pDown, q.Spread()
@@ -579,7 +525,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 	w.EntryLagMS = sql.NullFloat64{Float64: (w.DecisionTS - float64(ts)) * 1000, Valid: true}
 
-	if _, _, latest, ok := e.entryElapsed(ts); !ok || latest >= e.Cfg.EntryMaxLag {
+	if _, _, latest := e.entryElapsed(ts); latest >= e.Cfg.EntryMaxLag {
 		return e.finishSkip(ctx, w, "late", "late after quote")
 	}
 
@@ -623,7 +569,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return nil
 	}
 
-	if _, _, latest, ok := e.entryElapsed(ts); !ok || latest >= e.Cfg.EntryMaxLag {
+	if _, _, latest := e.entryElapsed(ts); latest >= e.Cfg.EntryMaxLag {
 		return e.finishSkip(ctx, w, "late", "deadline expired before order request")
 	}
 	sendCtx, sendCancel := context.WithDeadline(ctx, deadline)
@@ -797,11 +743,7 @@ func (e *Engine) finishSkip(ctx context.Context, w store.Window, reason, msg str
 	w.FillLagMS = sql.NullFloat64{}
 	e.stampClock(&w)
 	if w.DecisionTS == 0 {
-		if now, ok := e.entryClock(); ok {
-			w.DecisionTS = float64(now.UnixNano()) / 1e9
-		} else {
-			w.DecisionTS = e.unix()
-		}
+		w.DecisionTS = float64(e.entryClock().UnixNano()) / 1e9
 	}
 	e.saveWindow(ctx, w)
 	e.mu.Lock()
@@ -1208,13 +1150,6 @@ func (e *Engine) flogWindow(kind string, w store.Window) {
 		"p_up": w.PUp, "p_down": w.PDown, "spread": w.Spread, "quote_source": w.QuoteSource,
 		"side": w.Side, "skip_reason": w.SkipReason,
 	})
-}
-
-func absDur(d time.Duration) time.Duration {
-	if d < 0 {
-		return -d
-	}
-	return d
 }
 
 func errString(err error, ok string) string {

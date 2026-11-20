@@ -65,9 +65,6 @@ type Config struct {
 	CLOBURL      string
 	CLOBWSURL    string
 	BinanceURL   string
-
-	ClockAlertOffset time.Duration
-	ClockSkipOffset  time.Duration
 }
 
 func Load() (*Config, error) {
@@ -111,8 +108,6 @@ func Load() (*Config, error) {
 		CLOBURL:               getenv("PM_CLOB_URL", "https://clob.polymarket.com"),
 		CLOBWSURL:             getenv("PM_CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
 		BinanceURL:            getenv("BINANCE_URL", "https://api.binance.com"),
-		ClockAlertOffset:      200 * time.Millisecond,
-		ClockSkipOffset:       time.Second,
 	}
 	if cfg.InstanceName == "" {
 		cfg.InstanceName = cfg.Profile
