@@ -87,10 +87,41 @@ function TimingsView({ t, compact }: { t?: WindowTimings | null; compact?: boole
     return <span className="text-muted-foreground">—</span>;
   }
   if (compact) {
-    const bits = rows.map((s) => `${s.label} ${s.v!.toFixed(0)}`);
-    if (t.ms_open_to_decide) bits.unshift(`решение ${t.ms_open_to_decide.toFixed(0)}`);
-    if (t.ms_open_to_send) bits.push(`запрос ${t.ms_open_to_send.toFixed(0)}`);
-    return <span className="text-[11px] leading-snug">{bits.join(" · ")}</span>;
+    const milestones: { label: string; value: number | null | undefined }[] = [
+      { label: "quote", value: t.ms_open_to_quote },
+      { label: "решение", value: t.ms_open_to_decide },
+      { label: "send", value: t.ms_open_to_send },
+      { label: "ответ", value: t.ms_open_to_send_ack },
+    ];
+    return (
+      <div className="min-w-0 space-y-1 whitespace-normal">
+        <div className="flex flex-wrap gap-1">
+          {milestones.filter((x) => typeof x.value === "number" && x.value > 0).map((x) => (
+            <span key={x.label} className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5 text-[10px] leading-tight">
+              {x.label} <b>{x.value!.toFixed(0)}</b>
+            </span>
+          ))}
+          {t.ms_open_to_exchange ? (
+            <span className="whitespace-nowrap rounded bg-primary/10 px-1.5 py-0.5 text-[10px] leading-tight">
+              ордер <b>{t.ms_open_to_exchange.toFixed(0)}</b>
+            </span>
+          ) : null}
+        </div>
+        {rows.length > 0 ? (
+          <details className="text-[10px] text-muted-foreground">
+            <summary className="cursor-pointer select-none">все этапы ({rows.length})</summary>
+            <ul className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5">
+              {rows.map((s) => (
+                <li key={s.key} className="flex justify-between gap-2">
+                  <span>{s.label}</span>
+                  <span className="tabular-nums">{s.v!.toFixed(0)}</span>
+                </li>
+              ))}
+            </ul>
+          </details>
+        ) : null}
+      </div>
+    );
   }
   return (
     <ul className="space-y-1 text-sm">
@@ -431,7 +462,9 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                           <TableCell>{sideBadge(w.side)}</TableCell>
                           <TableCell>{fmt(w.p_up, 3)}</TableCell>
                           <TableCell>{ms(tradeLag(w))}</TableCell>
-                          <TableCell className="max-w-[18rem]"><TimingsView t={w.timings} compact /></TableCell>
+                          <TableCell className="max-w-[18rem] whitespace-normal">
+                            <TimingsView t={w.timings} compact />
+                          </TableCell>
                           <TableCell className={`text-xs ${pnlClass(num(w.pnl_usd))}`}>
                             {isTrade(w) ? (num(w.pnl_usd) != null ? `$${fmt(num(w.pnl_usd), 2)}` : w.exit_reason || "open") : skipLabel(w.skip_reason)}
                           </TableCell>
@@ -592,7 +625,42 @@ function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boo
     return <p className="text-sm text-muted-foreground">{tradesOnly ? "Сделок ещё нет" : "Окон ещё нет"}</p>;
   }
   return (
-    <div className="overflow-x-auto">
+    <>
+      <div className="grid gap-2 xl:hidden">
+        {rows.slice(0, 80).map((w) => (
+          <Card key={w.window_ts}>
+            <CardContent className="space-y-3 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-medium tabular-nums">{utc(w.window_ts)}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {w.exit_reason || (w.skip_reason ? skipLabel(w.skip_reason) : "окно")}
+                  </div>
+                </div>
+                {sideBadge(w.side)}
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                <MiniMetric label="PM Up" value={fmt(w.p_up, 3)} />
+                <MiniMetric label="Спред" value={fmt(w.spread, 3)} />
+                {!tradesOnly ? <MiniMetric label="Источник" value={w.quote_source || "—"} /> : null}
+                <MiniMetric label="Лаг :00 → ордер" value={ms(tradeLag(w))} />
+                <MiniMetric label="Lighter in" value={fmt(num(w.lighter_entry_px), 1)} />
+                <MiniMetric label="Lighter out" value={fmt(num(w.lighter_exit_px), 1)} />
+                <MiniMetric label="Стоп" value={fmt(num(w.stop_px), 1)} />
+                {tradesOnly ? <MiniMetric label="PnL" value={fmt(num(w.pnl_usd), 2)} /> : null}
+                {tradesOnly ? <MiniMetric label="Return bps" value={fmt(num(w.ret_bps), 1)} /> : null}
+                {tradesOnly ? <MiniMetric label="Тень bps" value={fmt(num(w.shadow_ret_bps), 1)} /> : null}
+                {tradesOnly ? <MiniMetric label="SL slip bps" value={fmt(num(w.sl_slip_bps), 1)} /> : null}
+              </div>
+              <div className="min-w-0 border-t pt-2">
+                <div className="mb-1 text-[10px] font-medium text-muted-foreground">Тайминг</div>
+                <TimingsView t={w.timings} compact />
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+      <div className="hidden overflow-x-auto xl:block">
       <Table>
         <TableHeader>
           <TableRow>
@@ -625,7 +693,9 @@ function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boo
               <TableCell className="text-xs">{w.quote_source || "—"}</TableCell>
               {!tradesOnly ? <TableCell className="text-xs">{w.skip_reason ? skipLabel(w.skip_reason) : "—"}</TableCell> : null}
               <TableCell>{ms(tradeLag(w))}</TableCell>
-              <TableCell className="max-w-[22rem]"><TimingsView t={w.timings} compact /></TableCell>
+              <TableCell className="max-w-[22rem] min-w-[16rem] whitespace-normal">
+                <TimingsView t={w.timings} compact />
+              </TableCell>
               <TableCell className="text-xs">{fmt(num(w.lighter_entry_px), 1)}</TableCell>
               <TableCell className="text-xs">{fmt(num(w.lighter_exit_px), 1)}</TableCell>
               <TableCell className="text-xs">{fmt(num(w.stop_px), 1)}</TableCell>
@@ -637,6 +707,16 @@ function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boo
           ))}
         </TableBody>
       </Table>
+      </div>
+    </>
+  );
+}
+
+function MiniMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-md bg-muted/60 px-2 py-1.5">
+      <div className="text-[10px] leading-tight text-muted-foreground">{label}</div>
+      <div className="truncate text-xs font-medium tabular-nums">{value}</div>
     </div>
   );
 }
