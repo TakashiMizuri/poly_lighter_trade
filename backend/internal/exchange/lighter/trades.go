@@ -158,6 +158,14 @@ func (o ExchangeOrder) Unix() float64 {
 	return tradeUnix(o.Timestamp)
 }
 
+// CreatedUnix is the exchange order-creation time (not trade print, not local clock).
+func (o ExchangeOrder) CreatedUnix() float64 {
+	if u := tradeUnix(o.CreatedAt); u > 0 {
+		return u
+	}
+	return tradeUnix(o.Timestamp)
+}
+
 func coarseUnix(ts int64) float64 {
 	if ts > 1_000_000_000_000_000 {
 		return float64(ts) / 1e6

@@ -8,6 +8,7 @@ import {
   Stats,
   Status,
   WindowRow,
+  WindowTimings,
   api,
   num,
 } from "./api";
@@ -50,8 +51,61 @@ function isTrade(w: WindowRow) {
 
 /** Лаг только у входов: open 5m UTC → timestamp ордера/fill на Lighter. */
 function tradeLag(w: WindowRow): number | null {
-  if (!isTrade(w)) return null;
+  if (!isTrade(w) || num(w.lighter_entry_px) == null) return null;
   return num(w.fill_lag_ms);
+}
+
+const TIMING_STEPS: { key: keyof WindowTimings; label: string }[] = [
+  { key: "ms_late_start", label: "опоздание к :00" },
+  { key: "ms_quote", label: "1. цена PM" },
+  { key: "ms_send", label: "2. отправка IOC" },
+  { key: "ms_fill_wait", label: "fill" },
+  { key: "ms_order_get", label: "timestamp ордера" },
+  { key: "ms_arm", label: "resolve рынка PM" },
+  { key: "ms_ready", label: "equity/цена Lighter" },
+  { key: "ms_warm_book", label: "прогрев стакана" },
+  { key: "ms_nonce", label: "nonce" },
+  { key: "ms_has_window", label: "sqlite" },
+  { key: "ms_equity", label: "equity fallback" },
+  { key: "ms_pos_check", label: "позиция" },
+  { key: "ms_stop", label: "стоп" },
+  { key: "ms_sqlite", label: "запись sqlite" },
+];
+
+function timingVal(t: WindowTimings | null | undefined, k: keyof WindowTimings): number | null {
+  if (!t) return null;
+  const v = t[k];
+  return typeof v === "number" && v > 0 ? v : null;
+}
+
+function TimingsView({ t, compact }: { t?: WindowTimings | null; compact?: boolean }) {
+  if (!t) return <span className="text-muted-foreground">—</span>;
+  const rows = TIMING_STEPS.map((s) => ({ ...s, v: timingVal(t, s.key) })).filter((s) => s.v != null);
+  if (rows.length === 0 && !t.ms_open_to_decide && !t.ms_open_to_exchange) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  if (compact) {
+    const bits = rows.map((s) => `${s.label} ${s.v!.toFixed(0)}`);
+    if (t.ms_open_to_decide) bits.unshift(`решение ${t.ms_open_to_decide.toFixed(0)}`);
+    if (t.ms_open_to_send) bits.push(`send ${t.ms_open_to_send.toFixed(0)}`);
+    return <span className="text-[11px] leading-snug">{bits.join(" · ")}</span>;
+  }
+  return (
+    <ul className="space-y-1 text-sm">
+      {t.ms_open_to_exchange ? (
+        <li className="flex justify-between gap-3 font-medium">
+          <span>лаг :00 → created_at ордера</span>
+          <span>{t.ms_open_to_exchange.toFixed(0)} ms</span>
+        </li>
+      ) : null}
+      {rows.map((s) => (
+        <li key={s.key} className="flex justify-between gap-3 text-muted-foreground">
+          <span>{s.label}</span>
+          <span>{s.v!.toFixed(0)} ms</span>
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 function skipLabel(reason: string) {
@@ -252,7 +306,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
               </Card>
               <Card>
                 <CardHeader className="pb-1">
-                  <CardTitle className="text-xs font-normal text-muted-foreground">Лаг входа :00 → ордер Lighter</CardTitle>
+                  <CardTitle className="text-xs font-normal text-muted-foreground">Лаг :00 → создание ордера</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-1">
                   <div className="text-lg font-medium">{stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"}</div>
@@ -260,12 +314,20 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                     Среднее по {stats?.n_fill_lag ?? 0} входам. Skip без ордера не входят.
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    p50 {ms(stats?.p50_fill_lag_ms)} · p90 {ms(stats?.p90_fill_lag_ms)} · timestamp ордера на бирже минус
-                    open окна UTC
+                    p50 {ms(stats?.p50_fill_lag_ms)} · p90 {ms(stats?.p90_fill_lag_ms)}. Формула одна: дата создания
+                    ордера на Lighter минус :00 окна UTC. Skip без ордера — не лаг.
                   </p>
                 </CardContent>
               </Card>
             </div>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm">Последнее окно — из чего сложилось время</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <TimingsView t={windows[0]?.timings || status.last_timings} />
+              </CardContent>
+            </Card>
 
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <Stat label="Equity Lighter" value={`$${fmt(status.equity)}`} hint="Живой счёт" />
@@ -356,6 +418,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                         <TableHead>сторона</TableHead>
                         <TableHead>p_up</TableHead>
                         <TableHead>лаг</TableHead>
+                        <TableHead>этапы, ms</TableHead>
                         <TableHead>итог</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -366,6 +429,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                           <TableCell>{sideBadge(w.side)}</TableCell>
                           <TableCell>{fmt(w.p_up, 3)}</TableCell>
                           <TableCell>{ms(tradeLag(w))}</TableCell>
+                          <TableCell className="max-w-[18rem]"><TimingsView t={w.timings} compact /></TableCell>
                           <TableCell className={`text-xs ${pnlClass(num(w.pnl_usd))}`}>
                             {isTrade(w) ? (num(w.pnl_usd) != null ? `$${fmt(num(w.pnl_usd), 2)}` : w.exit_reason || "open") : skipLabel(w.skip_reason)}
                           </TableCell>
@@ -392,7 +456,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
 
           <TabsContent value="trades" className="space-y-3 p-4">
             <p className="text-xs text-muted-foreground">
-              Только окна, в которые бот вошёл. Лаг = timestamp ордера на Lighter минус :00 окна UTC. Skip здесь нет.
+              Только входы. Лаг = created_at ордера на Lighter − :00 UTC. Ничего больше в лаг не входит.
             </p>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <Stat label="Средний лаг" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} />
@@ -405,14 +469,14 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
 
           <TabsContent value="windows" className="p-4">
             <p className="mb-2 text-xs text-muted-foreground">
-              Каждое 5m окно. Колонка лага пустая на skip — ордера не было, это не «медленный вход».
+              Лаг только если ордер создан на бирже. Skip = «—». Колонка «этапы» — диагностика, это не лаг.
             </p>
             <WindowTable rows={windows} />
           </TabsContent>
 
           <TabsContent value="exec" className="space-y-3 p-4">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Stat label="Средний лаг входов" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} hint="Только long/short с timestamp биржи" />
+              <Stat label="Средний лаг входов" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} hint=":00 UTC → created_at ордера Lighter" />
               <Stat label="p50 / p90 лаг" value={`${ms(stats?.p50_fill_lag_ms)} / ${ms(stats?.p90_fill_lag_ms)}`} />
               <Stat label="paired live/тень" value={String(stats?.n_paired ?? 0)} />
               <Stat label="выходы по SL" value={String(stats?.n_sl ?? 0)} />
@@ -538,6 +602,7 @@ function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boo
             <TableHead>котировка</TableHead>
             {!tradesOnly ? <TableHead>skip</TableHead> : null}
             <TableHead>лаг :00→ордер</TableHead>
+            <TableHead>этапы, ms</TableHead>
             <TableHead>Lighter in</TableHead>
             <TableHead>Lighter out</TableHead>
             <TableHead>стоп</TableHead>
@@ -558,6 +623,7 @@ function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boo
               <TableCell className="text-xs">{w.quote_source || "—"}</TableCell>
               {!tradesOnly ? <TableCell className="text-xs">{w.skip_reason ? skipLabel(w.skip_reason) : "—"}</TableCell> : null}
               <TableCell>{ms(tradeLag(w))}</TableCell>
+              <TableCell className="max-w-[22rem]"><TimingsView t={w.timings} compact /></TableCell>
               <TableCell className="text-xs">{fmt(num(w.lighter_entry_px), 1)}</TableCell>
               <TableCell className="text-xs">{fmt(num(w.lighter_exit_px), 1)}</TableCell>
               <TableCell className="text-xs">{fmt(num(w.stop_px), 1)}</TableCell>

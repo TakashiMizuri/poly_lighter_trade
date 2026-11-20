@@ -58,6 +58,47 @@ func TestFillLagStatsOnlyTrades(t *testing.T) {
 	if stt.P50FillLagMS != 350 {
 		t.Fatalf("p50 %v", stt.P50FillLagMS)
 	}
+	skip.EntryLagMS.Float64, skip.EntryLagMS.Valid = 7, true
+	if err := st.UpdateWindow(ctx, skip); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := st.ListWindows(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range listed {
+		if w.Side == "skip" && (w.FillLagMS.Valid || w.EntryLagMS.Valid) {
+			t.Fatalf("skip must not expose lag: %+v", w)
+		}
+	}
+}
+
+func TestWindowTimingsRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	w := Window{WindowTS: 2000, Side: "skip", SkipReason: "below_th", Timings: &Timings{MsLateStart: 1812, MsQuote: 3, MsOpenToDecide: 1815}}
+	if err := st.InsertWindow(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetWindow(ctx, 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Timings == nil || got.Timings.MsLateStart != 1812 || got.Timings.MsQuote != 3 {
+		t.Fatalf("timings %+v", got.Timings)
+	}
+	list, err := st.ListWindows(ctx, 5)
+	if err != nil || len(list) != 1 || list[0].Timings == nil || list[0].Timings.MsOpenToDecide != 1815 {
+		t.Fatalf("list timings")
+	}
+	if list[0].FillLagMS.Valid || list[0].EntryLagMS.Valid {
+		t.Fatal("skip must hide fill/entry lag")
+	}
 }
 
 func TestLiveShadowGap(t *testing.T) {

@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS bot_state (
 		`ALTER TABLE windows ADD COLUMN sl_slip_bps REAL`,
 		`ALTER TABLE windows ADD COLUMN clock_offset_ms REAL`,
 		`ALTER TABLE windows ADD COLUMN clock_rtt_ms REAL`,
+		`ALTER TABLE windows ADD COLUMN timings TEXT`,
 	} {
 		_, _ = s.DB.Exec(q)
 	}
@@ -153,6 +154,7 @@ type Window struct {
 	SLSlipBps         sql.NullFloat64 `json:"sl_slip_bps"`
 	ClockOffsetMS     sql.NullFloat64 `json:"clock_offset_ms"`
 	ClockRTTMS        sql.NullFloat64 `json:"clock_rtt_ms"`
+	Timings           *Timings        `json:"timings,omitempty"`
 }
 
 func nullF(v float64, valid bool) any {
@@ -169,8 +171,8 @@ INSERT INTO windows(
   lighter_entry_ts, lighter_entry_px, lighter_exit_ts, lighter_exit_px,
   qty, notional, equity_before, equity_after, pnl_usd, ret_bps, fees_usd,
   entry_lag_ms, fill_lag_ms, shadow_binance_px_t1, shadow_ret_bps, pm_fav, state,
-  stop_px, exit_reason, sl_slip_bps, clock_offset_ms, clock_rtt_ms
-) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  stop_px, exit_reason, sl_slip_bps, clock_offset_ms, clock_rtt_ms, timings
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		w.WindowTS, w.DecisionTS, w.QuoteTS, w.PUp, w.PDown, w.Spread, w.QuoteSource, w.Side, w.SkipReason,
 		nullF(w.LighterEntryTS.Float64, w.LighterEntryTS.Valid),
 		nullF(w.LighterEntryPx.Float64, w.LighterEntryPx.Valid),
@@ -194,6 +196,7 @@ INSERT INTO windows(
 		nullF(w.SLSlipBps.Float64, w.SLSlipBps.Valid),
 		nullF(w.ClockOffsetMS.Float64, w.ClockOffsetMS.Valid),
 		nullF(w.ClockRTTMS.Float64, w.ClockRTTMS.Valid),
+		timingsArg(w.Timings),
 	)
 	if err != nil {
 		return fmt.Errorf("insert window %d: %w", w.WindowTS, err)
@@ -214,7 +217,7 @@ UPDATE windows SET
   lighter_entry_ts=?, lighter_entry_px=?, lighter_exit_ts=?, lighter_exit_px=?,
   qty=?, notional=?, equity_before=?, equity_after=?, pnl_usd=?, ret_bps=?, fees_usd=?,
   entry_lag_ms=?, fill_lag_ms=?, shadow_binance_px_t1=?, shadow_ret_bps=?, pm_fav=?, state=?,
-  stop_px=?, exit_reason=?, sl_slip_bps=?, clock_offset_ms=?, clock_rtt_ms=?
+  stop_px=?, exit_reason=?, sl_slip_bps=?, clock_offset_ms=?, clock_rtt_ms=?, timings=?
 WHERE window_ts=?`,
 		w.DecisionTS, w.QuoteTS, w.PUp, w.PDown, w.Spread, w.QuoteSource, w.Side, w.SkipReason,
 		nullF(w.LighterEntryTS.Float64, w.LighterEntryTS.Valid),
@@ -239,6 +242,7 @@ WHERE window_ts=?`,
 		nullF(w.SLSlipBps.Float64, w.SLSlipBps.Valid),
 		nullF(w.ClockOffsetMS.Float64, w.ClockOffsetMS.Valid),
 		nullF(w.ClockRTTMS.Float64, w.ClockRTTMS.Valid),
+		timingsArg(w.Timings),
 		w.WindowTS,
 	)
 	return err
@@ -251,14 +255,16 @@ SELECT window_ts, IFNULL(decision_ts,0), IFNULL(quote_ts,0), IFNULL(p_up,0), IFN
   lighter_entry_ts, lighter_entry_px, lighter_exit_ts, lighter_exit_px,
   qty, notional, equity_before, equity_after, pnl_usd, ret_bps, fees_usd,
   entry_lag_ms, fill_lag_ms, shadow_binance_px_t1, shadow_ret_bps, pm_fav, IFNULL(state,''),
-  stop_px, IFNULL(exit_reason,''), sl_slip_bps, clock_offset_ms, clock_rtt_ms
+  stop_px, IFNULL(exit_reason,''), sl_slip_bps, clock_offset_ms, clock_rtt_ms, IFNULL(timings,'')
 FROM windows WHERE window_ts=?`, ts)
 	var w Window
+	var timingsRaw string
 	err := row.Scan(&w.WindowTS, &w.DecisionTS, &w.QuoteTS, &w.PUp, &w.PDown, &w.Spread, &w.QuoteSource, &w.Side, &w.SkipReason,
 		&w.LighterEntryTS, &w.LighterEntryPx, &w.LighterExitTS, &w.LighterExitPx,
 		&w.Qty, &w.Notional, &w.EquityBefore, &w.EquityAfter, &w.PnLUSD, &w.RetBps, &w.FeesUSD,
 		&w.EntryLagMS, &w.FillLagMS, &w.ShadowBinancePxT1, &w.ShadowRetBps, &w.PMFav, &w.State,
-		&w.StopPx, &w.ExitReason, &w.SLSlipBps, &w.ClockOffsetMS, &w.ClockRTTMS)
+		&w.StopPx, &w.ExitReason, &w.SLSlipBps, &w.ClockOffsetMS, &w.ClockRTTMS, &timingsRaw)
+	w.Timings = parseTimings(timingsRaw)
 	return w, err
 }
 
@@ -272,7 +278,7 @@ SELECT window_ts, IFNULL(decision_ts,0), IFNULL(quote_ts,0), IFNULL(p_up,0), IFN
   lighter_entry_ts, lighter_entry_px, lighter_exit_ts, lighter_exit_px,
   qty, notional, equity_before, equity_after, pnl_usd, ret_bps, fees_usd,
   entry_lag_ms, fill_lag_ms, shadow_binance_px_t1, shadow_ret_bps, pm_fav, IFNULL(state,''),
-  stop_px, IFNULL(exit_reason,''), sl_slip_bps, clock_offset_ms, clock_rtt_ms
+  stop_px, IFNULL(exit_reason,''), sl_slip_bps, clock_offset_ms, clock_rtt_ms, IFNULL(timings,'')
 FROM windows ORDER BY window_ts DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -281,12 +287,18 @@ FROM windows ORDER BY window_ts DESC LIMIT ?`, limit)
 	var out []Window
 	for rows.Next() {
 		var w Window
+		var timingsRaw string
 		if err := rows.Scan(&w.WindowTS, &w.DecisionTS, &w.QuoteTS, &w.PUp, &w.PDown, &w.Spread, &w.QuoteSource, &w.Side, &w.SkipReason,
 			&w.LighterEntryTS, &w.LighterEntryPx, &w.LighterExitTS, &w.LighterExitPx,
 			&w.Qty, &w.Notional, &w.EquityBefore, &w.EquityAfter, &w.PnLUSD, &w.RetBps, &w.FeesUSD,
 			&w.EntryLagMS, &w.FillLagMS, &w.ShadowBinancePxT1, &w.ShadowRetBps, &w.PMFav, &w.State,
-			&w.StopPx, &w.ExitReason, &w.SLSlipBps, &w.ClockOffsetMS, &w.ClockRTTMS); err != nil {
+			&w.StopPx, &w.ExitReason, &w.SLSlipBps, &w.ClockOffsetMS, &w.ClockRTTMS, &timingsRaw); err != nil {
 			return nil, err
+		}
+		w.Timings = parseTimings(timingsRaw)
+		if w.Side == "skip" {
+			w.EntryLagMS = sql.NullFloat64{}
+			w.FillLagMS = sql.NullFloat64{}
 		}
 		out = append(out, w)
 	}
@@ -511,9 +523,9 @@ WHERE lighter_entry_px IS NOT NULL AND ret_bps IS NOT NULL AND shadow_ret_bps IS
 	if livePaired.Valid && shadowPaired.Valid {
 		st.GapBps, st.MatchCoef = LiveShadowGap(livePaired.Float64, shadowPaired.Float64)
 	}
-	st.P50LagMS = percentile(s, ctx, "entry_lag_ms", 0.50)
-	st.P90LagMS = percentile(s, ctx, "entry_lag_ms", 0.90)
 	const tradeLag = `side IN ('long','short') AND lighter_entry_px IS NOT NULL AND fill_lag_ms IS NOT NULL`
+	st.P50LagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.50)
+	st.P90LagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.90)
 	var meanLag sql.NullFloat64
 	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1), AVG(fill_lag_ms) FROM windows WHERE `+tradeLag).Scan(&st.NFillLag, &meanLag)
 	if meanLag.Valid {

@@ -18,10 +18,10 @@ import (
 )
 
 type Client struct {
-	Gamma  string
-	CLOB   string
-	WSURL  string
-	HTTP   *http.Client
+	Gamma string
+	CLOB  string
+	WSURL string
+	HTTP  *http.Client
 
 	mu      sync.Mutex
 	books   map[string]*book
@@ -237,12 +237,12 @@ func (c *Client) WarmREST(ctx context.Context, mkt Market) {
 
 func (c *Client) SnapshotCached(mkt Market, now time.Time, maxAge time.Duration) (strategy.Quote, error) {
 	q := strategy.Quote{TokenUp: mkt.TokenUp, TokenDown: mkt.TokenDown}
-	bid, ask, ok := c.cached(mkt.TokenUp, now, maxAge)
+	bid, ask, recv, ok := c.cached(mkt.TokenUp, now, maxAge)
 	if !ok {
 		return q, fmt.Errorf("no live book")
 	}
-	q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, now, "ws_clob"
-	if dBid, dAsk, dOK := c.cached(mkt.TokenDown, now, maxAge); dOK {
+	q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, recv, "ws_clob"
+	if dBid, dAsk, _, dOK := c.cached(mkt.TokenDown, now, maxAge); dOK {
 		q.BidDown, q.AskDown, q.HasDown = dBid, dAsk, true
 	}
 	return q, nil
@@ -275,17 +275,17 @@ func (c *Client) SnapshotUp(ctx context.Context, mkt Market, now time.Time, maxA
 	return q, nil
 }
 
-func (c *Client) cached(token string, now time.Time, maxAge time.Duration) (bid, ask float64, ok bool) {
+func (c *Client) cached(token string, now time.Time, maxAge time.Duration) (bid, ask float64, recv time.Time, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b := c.books[token]
 	if b == nil || b.bid <= 0 || b.ask <= 0 {
-		return 0, 0, false
+		return 0, 0, time.Time{}, false
 	}
 	if now.Sub(b.recv) > maxAge {
-		return 0, 0, false
+		return 0, 0, time.Time{}, false
 	}
-	return b.bid, b.ask, true
+	return b.bid, b.ask, b.recv, true
 }
 
 func (c *Client) setBook(token string, bid, ask float64, recv time.Time) {

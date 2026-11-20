@@ -1,3 +1,27 @@
+export type WindowTimings = {
+  open_unix?: number;
+  ms_late_start?: number;
+  ms_arm?: number;
+  ms_ready?: number;
+  ms_warm_book?: number;
+  ms_nonce?: number;
+  ms_has_window?: number;
+  ms_quote?: number;
+  ms_equity?: number;
+  ms_send?: number;
+  ms_fill_wait?: number;
+  ms_pos_check?: number;
+  ms_order_get?: number;
+  ms_stop?: number;
+  ms_sqlite?: number;
+  ms_open_to_quote?: number;
+  ms_open_to_decide?: number;
+  ms_open_to_send?: number;
+  ms_open_to_exchange?: number;
+  ms_send_to_exchange?: number;
+  quote_source?: string;
+};
+
 export type Status = {
   profile: string;
   instance_id: string;
@@ -37,6 +61,7 @@ export type Status = {
   threshold: number;
   leverage: number;
   equity_fraction: number;
+  last_timings?: WindowTimings | null;
 };
 
 export type Stats = {
@@ -95,6 +120,7 @@ export type WindowRow = {
   sl_slip_bps: NullF;
   clock_offset_ms: NullF;
   clock_rtt_ms: NullF;
+  timings?: WindowTimings | null;
 };
 
 export type EquityPoint = { ts: number; live: number; shadow: number };

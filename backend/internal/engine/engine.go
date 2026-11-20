@@ -76,6 +76,8 @@ type Engine struct {
 	readyEq     float64
 	readyPx     float64
 	readyAt     time.Time
+	tr          *winTrace
+	lastTimings *store.Timings
 }
 
 func New(cfg *config.Config, st *store.Store, httpClient *lighter.HTTPClient, signer *lighter.Signer, markets map[string]lighter.MarketMeta, pm *polymarket.Client, bn *binance.Client, n notify.Notifier, log *slog.Logger) *Engine {
@@ -92,7 +94,8 @@ func New(cfg *config.Config, st *store.Store, httpClient *lighter.HTTPClient, si
 }
 
 func (e *Engine) now() time.Time {
-	return time.Now().Add(e.offset)
+	// Window grid is UTC wall clock. Binance offset is telemetry only — never shift :00.
+	return time.Now().UTC()
 }
 
 func (e *Engine) unix() float64 {
@@ -137,6 +140,11 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	_ = e.Store.SaveGlobal(ctx, g)
 	_ = e.Store.InsertEquity(ctx, time.Now().Unix(), "live", eq)
 	e.alert(ctx, "info", "boot", fmt.Sprintf("POLY_LIGHTER_1 онлайн · %s · lev=%.1fx · frac=%.2f · equity=%.2f", e.Cfg.Network, e.Cfg.Leverage, e.Cfg.EquityFraction, eq))
+	go func() {
+		if err := e.syncClock(context.Background(), 3); err != nil {
+			e.Log.Warn("boot clock (telemetry only)", "err", err)
+		}
+	}()
 	return nil
 }
 
@@ -212,6 +220,7 @@ func (e *Engine) tick(ctx context.Context) error {
 }
 
 func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
+	e.beginTrace(next)
 	prewarm := time.Unix(next, 0).UTC().Add(-time.Duration(e.Cfg.PrewarmSeconds * float64(time.Second)))
 	if e.now().Before(prewarm) {
 		e.setState(StateIdle)
@@ -220,14 +229,21 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 		}
 	}
 	open := time.Unix(next, 0).UTC()
-	probes := 0
 	if e.now().Before(open.Add(-3 * time.Second)) {
-		probes = 3
+		if err := e.syncClock(ctx, 3); err != nil {
+			e.Log.Warn("prewarm clock", "err", err)
+		} else if e.offsetOK && absDur(e.offset) > e.Cfg.ClockAlertOffset {
+			e.alert(ctx, "warn", "clock", fmt.Sprintf("offset=%s", e.offset))
+		}
 	}
-	if err := e.arm(ctx, next, probes); err != nil {
+	tArm := time.Now()
+	if err := e.arm(ctx, next); err != nil {
 		e.Log.Warn("arm", "err", err, "ts", next)
 	}
+	e.traceDur("arm", tArm)
+	tReady := time.Now()
 	_ = e.refreshReady(ctx)
+	e.traceDur("ready", tReady)
 	for e.now().Before(open.Add(-400 * time.Millisecond)) {
 		_ = e.refreshReady(ctx)
 		wake := e.now().Add(time.Second)
@@ -244,10 +260,14 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 	if e.now().Before(open.Add(-80 * time.Millisecond)) {
 		wctx, cancel := context.WithDeadline(ctx, open.Add(-50*time.Millisecond))
 		if e.PM != nil {
+			tWarm := time.Now()
 			e.PM.WarmREST(wctx, mkt)
+			e.traceDur("warm_book", tWarm)
 		}
 		if e.HTTP != nil {
+			tN := time.Now()
 			_, _ = e.HTTP.GetNextNonce(e.Cfg.AccountIndex, e.Cfg.APIKeyIndex)
+			e.traceDur("nonce", tN)
 		}
 		cancel()
 	}
@@ -276,16 +296,8 @@ func (e *Engine) refreshReady(ctx context.Context) error {
 	return nil
 }
 
-func (e *Engine) arm(ctx context.Context, ts int64, clockProbes int) error {
+func (e *Engine) arm(ctx context.Context, ts int64) error {
 	e.setState(StateArming)
-	if clockProbes > 0 {
-		if err := e.syncClock(ctx, clockProbes); err != nil {
-			e.Log.Warn("clock", "err", err)
-		}
-		if e.offsetOK && absDur(e.offset) > e.Cfg.ClockAlertOffset {
-			e.alert(ctx, "warn", "clock", fmt.Sprintf("offset=%s", e.offset))
-		}
-	}
 	slug := e.Cfg.EventSlug(ts)
 	mkt, err := e.PM.Resolve(ctx, slug)
 	if err != nil {
@@ -332,17 +344,24 @@ func (e *Engine) stampClock(w *store.Window) {
 }
 
 func (e *Engine) saveWindow(ctx context.Context, w store.Window) {
+	e.applyTrace(&w)
+	tSQL := time.Now()
 	if err := e.Store.InsertWindow(ctx, w); err != nil {
 		_ = e.Store.UpdateWindow(ctx, w)
 	}
+	e.traceDur("sqlite", tSQL)
 }
 
 func (e *Engine) decide(ctx context.Context, ts int64) error {
+	e.beginTrace(ts)
+	e.stampLateStart()
 	e.setState(StateDecide)
 	if e.consumedTS == ts {
 		return e.sleepToExit(ctx, ts)
 	}
+	tHas := time.Now()
 	exists, err := e.Store.HasWindow(ctx, ts)
+	e.traceDur("has_window", tHas)
 	if err != nil {
 		return err
 	}
@@ -362,6 +381,9 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	if e.now().Sub(time.Unix(ts, 0).UTC()) >= e.Cfg.EntryMaxLag {
 		return e.finishSkip(ctx, w, "late", "past T+2s")
 	}
+	if e.offsetOK && absDur(e.offset) > e.Cfg.ClockSkipOffset {
+		return e.finishSkip(ctx, w, "clock", "clock offset > 1s")
+	}
 
 	e.mu.Lock()
 	mkt := e.armedMarket
@@ -369,9 +391,11 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	eq, px := e.readyEq, e.readyPx
 	e.mu.Unlock()
 	if !armed {
-		if err := e.arm(ctx, ts, 0); err != nil {
+		tArm := time.Now()
+		if err := e.arm(ctx, ts); err != nil {
 			return e.finishSkip(ctx, w, "no_market", err.Error())
 		}
+		e.traceDur("arm", tArm)
 		e.mu.Lock()
 		mkt = e.armedMarket
 		e.mu.Unlock()
@@ -380,7 +404,10 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "no_market", "empty tokens")
 	}
 
-	q, err := e.PM.SnapshotCached(mkt, e.now(), 15*time.Second)
+	tQ := time.Now()
+	q, err := e.PM.SnapshotCached(mkt, e.now(), time.Second)
+	e.traceDur("quote", tQ)
+	e.traceOpenTo("quote", time.Now().UTC())
 	if err != nil {
 		return e.finishSkip(ctx, w, "bad_quote", err.Error())
 	}
@@ -402,7 +429,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	w.PUp, w.PDown, w.Spread = pUp, pDown, q.Spread()
 	w.QuoteSource = q.Source
 	w.PMFav = sql.NullFloat64{Float64: math.Max(pUp, pDown), Valid: true}
-	w.EntryLagMS = sql.NullFloat64{Float64: (w.DecisionTS - float64(ts)) * 1000, Valid: true}
+	e.traceOpenTo("decide", time.Now().UTC())
 	e.mu.Lock()
 	e.lastQuote = q
 	e.mu.Unlock()
@@ -414,12 +441,14 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	if side == strategy.SideSkip {
 		return e.finishSkip(ctx, w, skipReason, skipReason)
 	}
+	w.EntryLagMS = sql.NullFloat64{Float64: (w.DecisionTS - float64(ts)) * 1000, Valid: true}
 
 	if e.now().Sub(time.Unix(ts, 0).UTC()) >= e.Cfg.EntryMaxLag {
 		return e.finishSkip(ctx, w, "late", "late after quote")
 	}
 
 	if eq <= 0 || px <= 0 || time.Since(e.readyAt) > 20*time.Second {
+		tEq := time.Now()
 		var err error
 		eq, err = e.equity(ctx)
 		if err != nil {
@@ -429,6 +458,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		if err != nil || px <= 0 {
 			return e.finishSkip(ctx, w, "no_px", fmt.Sprintf("%v", err))
 		}
+		e.traceDur("equity", tEq)
 	}
 	meta := e.Markets[e.Cfg.Symbol]
 	qty := strategy.FloorLot((eq*e.Cfg.EquityFraction*e.Cfg.Leverage)/px, meta.SizeDecimals)
@@ -456,7 +486,6 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		e.mu.Unlock()
 		w.LighterEntryTS = sql.NullFloat64{Float64: e.unix(), Valid: true}
 		w.LighterEntryPx = sql.NullFloat64{Float64: px, Valid: true}
-		w.FillLagMS = sql.NullFloat64{Float64: (e.unix() - float64(ts)) * 1000, Valid: true}
 		w.State = StateInPosition
 		e.saveWindow(ctx, w)
 		e.setState(StateInPosition)
@@ -465,7 +494,10 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return nil
 	}
 
+	tSend := time.Now()
 	res, err := e.Signer.MarketIOC(e.Cfg.Symbol, buy, qty, px, e.Cfg.MarketSlippage, clientIdx, false)
+	e.traceDur("send", tSend)
+	e.traceOpenTo("send", time.Now().UTC())
 	w.State = "sent"
 	e.saveWindow(ctx, w)
 	_ = e.Store.InsertOrder(ctx, ts, "entry", errString(err, "sent"), clientIdx, hashOf(res), qty, px, nil)
@@ -473,11 +505,14 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "order_failed", err.Error())
 	}
 
+	tFill := time.Now()
 	fillPx, fillQty, fee, fillUnix := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, px, 300*time.Millisecond)
+	e.traceDur("fill_wait", tFill)
 	if fillPx <= 0 {
 		fillPx = px
 	}
 	if fillQty <= 0 {
+		tPos := time.Now()
 		if flat, p := e.isFlat(ctx); !flat && p.Size > 0 {
 			fillQty = p.Size
 			if p.AvgEntry > 0 {
@@ -485,6 +520,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 			}
 			e.Log.Info("fill from position", "qty", fillQty, "px", fillPx, "client", clientIdx)
 		}
+		e.traceDur("pos_check", tPos)
 	}
 	if fillQty <= 0 {
 		e.alert(ctx, "error", "entry", "ордер отправлен, филла нет — flatten")
@@ -510,22 +546,27 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		usedQty = qty
 	}
 	fillTS := fillUnix
+	var fillLag sql.NullFloat64
 	octx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
+	tOrd := time.Now()
 	if o, err := e.HTTP.OrderByClient(octx, e.Cfg.AccountIndex, clientIdx); err == nil {
-		if u := o.Unix(); u > 0 {
+		if u := o.CreatedUnix(); u > 0 {
+			fillLag = sql.NullFloat64{Float64: (u - float64(ts)) * 1000, Valid: true}
 			fillTS = u
 		}
 	}
+	e.traceDur("order_get", tOrd)
 	cancel()
-	var fillLag sql.NullFloat64
-	if fillTS > 0 {
-		fillLag = sql.NullFloat64{Float64: (fillTS - float64(ts)) * 1000, Valid: true}
+	if fillLag.Valid && e.tr != nil {
+		e.tr.t.MsOpenToExchange = fillLag.Float64
 	}
 	stopPx := strategy.StopPx(fillPx, side, e.Cfg.StopPricePct)
 	stopIdx := int64(0)
 	if stopPx > 0 {
 		stopIdx = e.nextClientIdx(ctx)
+		tStop := time.Now()
 		stopResult, stopErr := e.Signer.StopLoss(e.Cfg.Symbol, side == strategy.SideLong, usedQty, stopPx, e.Cfg.MarketSlippage, stopIdx)
+		e.traceDur("stop", tStop)
 		status := errString(stopErr, "sent")
 		_ = e.Store.InsertOrder(ctx, ts, "stop_loss", status, stopIdx, hashOf(stopResult), usedQty, stopPx, map[string]any{"trigger_price": stopPx, "reduce_only": true})
 		if stopErr != nil {
@@ -580,6 +621,7 @@ func (e *Engine) finishSkip(ctx context.Context, w store.Window, reason, msg str
 	w.SkipReason = reason
 	w.ExitReason = "skip"
 	w.State = "skip"
+	w.EntryLagMS = sql.NullFloat64{}
 	w.FillLagMS = sql.NullFloat64{}
 	e.stampClock(&w)
 	if w.DecisionTS == 0 {
@@ -597,18 +639,17 @@ func (e *Engine) finishSkip(ctx context.Context, w store.Window, reason, msg str
 }
 
 func (e *Engine) sleepToExit(ctx context.Context, ts int64) error {
-	exitAt := time.Unix(ts, 0).UTC().Add(300*time.Second - e.Cfg.ExitEarly)
 	e.setState(StateIdle)
-	if e.now().After(exitAt) {
+	e.shadowAsync(ts)
+	return e.waitNextOpen(ctx, ts+clock.WindowSec)
+}
+
+func (e *Engine) shadowAsync(ts int64) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
 		_ = e.fillShadow(ctx, ts)
-		return nil
-	}
-	if err := clock.SleepUntil(ctx, exitAt, e.now); err != nil {
-		return err
-	}
-	_ = e.ensureFlat(ctx, "boundary")
-	_ = e.fillShadow(ctx, ts)
-	return nil
+	}()
 }
 
 func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string) error {
@@ -714,8 +755,8 @@ func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string)
 	e.setState(StateIdle)
 	e.flogWindow("exit", w)
 	e.alert(ctx, "info", "exit", fmt.Sprintf("%s pnl=%.2f ret=%.2fbps eq=%.2f", pos.Side, pnl-fees, ret*1e4, eq))
-	_ = e.fillShadow(ctx, pos.WindowTS)
-	return nil
+	e.shadowAsync(pos.WindowTS)
+	return e.waitNextOpen(ctx, pos.WindowTS+clock.WindowSec)
 }
 
 func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64, err error) {
@@ -844,12 +885,24 @@ func (e *Engine) fillShadow(ctx context.Context, ts int64) error {
 	}
 	side := w.Side
 	if side == strategy.SideLong || side == strategy.SideShort {
-		if err1 == nil && err2 == nil && px1 > 0 && pxC > 0 {
-			ret := strategy.Sign(side) * (pxC/px1 - 1)
+		if err1 == nil && px1 > 0 {
+			stopPx := strategy.StopPx(px1, side, e.Cfg.StopPricePct)
+			hit, _ := e.BN.StopHit1s(ctx, "BTCUSDT", ts+1, ts+300, side == strategy.SideLong, stopPx)
+			var ret float64
+			if hit && stopPx > 0 {
+				ret = strategy.Sign(side) * (stopPx/px1 - 1)
+			} else if err2 == nil && pxC > 0 {
+				ret = strategy.Sign(side) * (pxC/px1 - 1)
+			} else {
+				return e.Store.UpdateWindow(ctx, w)
+			}
 			w.ShadowRetBps = sql.NullFloat64{Float64: ret * 1e4, Valid: true}
+			e.mu.Lock()
 			e.global.ShadowEquity *= (1 + ret*e.Cfg.Leverage*e.Cfg.EquityFraction)
-			_ = e.Store.InsertEquity(ctx, ts+300, "shadow", e.global.ShadowEquity)
-			_ = e.Store.SaveGlobal(ctx, e.global)
+			g := e.global
+			e.mu.Unlock()
+			_ = e.Store.InsertEquity(ctx, ts+300, "shadow", g.ShadowEquity)
+			_ = e.Store.SaveGlobal(ctx, g)
 		}
 	}
 	return e.Store.UpdateWindow(ctx, w)
@@ -942,9 +995,6 @@ func (e *Engine) Health() (bool, string) {
 	}
 	if e.global.KillSwitch {
 		return false, "kill-switch"
-	}
-	if e.offsetOK && absDur(e.offset) > e.Cfg.ClockSkipOffset {
-		return false, "clock offset"
 	}
 	return true, e.state
 }
