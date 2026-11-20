@@ -46,7 +46,7 @@ func New(gamma, clob, ws string) *Client {
 		Gamma: strings.TrimRight(gamma, "/"),
 		CLOB:  strings.TrimRight(clob, "/"),
 		WSURL: ws,
-		HTTP:  &http.Client{Timeout: 8 * time.Second},
+		HTTP:  &http.Client{Timeout: 600 * time.Millisecond},
 		books: map[string]*book{},
 	}
 }
@@ -221,15 +221,38 @@ func (c *Client) GammaMid(ctx context.Context, slug string) (float64, error) {
 	return 0, fmt.Errorf("no up price")
 }
 
-func (c *Client) SnapshotUp(ctx context.Context, mkt Market, now time.Time, maxAge time.Duration) (strategy.Quote, error) {
-	q := strategy.Quote{TokenUp: mkt.TokenUp, TokenDown: mkt.TokenDown}
-	if bid, ask, ok := c.cached(mkt.TokenUp, now, maxAge); ok {
-		q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, now, "ws_clob"
-		if dBid, dAsk, dOK := c.cached(mkt.TokenDown, now, maxAge); dOK {
-			q.BidDown, q.AskDown, q.HasDown = dBid, dAsk, true
+func (c *Client) WarmREST(ctx context.Context, mkt Market) {
+	now := time.Now()
+	if mkt.TokenUp != "" {
+		if bid, ask, err := c.RESTBook(ctx, mkt.TokenUp); err == nil {
+			c.setBook(mkt.TokenUp, bid, ask, now)
 		}
+	}
+	if mkt.TokenDown != "" {
+		if bid, ask, err := c.RESTBook(ctx, mkt.TokenDown); err == nil {
+			c.setBook(mkt.TokenDown, bid, ask, now)
+		}
+	}
+}
+
+func (c *Client) SnapshotCached(mkt Market, now time.Time, maxAge time.Duration) (strategy.Quote, error) {
+	q := strategy.Quote{TokenUp: mkt.TokenUp, TokenDown: mkt.TokenDown}
+	bid, ask, ok := c.cached(mkt.TokenUp, now, maxAge)
+	if !ok {
+		return q, fmt.Errorf("no live book")
+	}
+	q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, now, "ws_clob"
+	if dBid, dAsk, dOK := c.cached(mkt.TokenDown, now, maxAge); dOK {
+		q.BidDown, q.AskDown, q.HasDown = dBid, dAsk, true
+	}
+	return q, nil
+}
+
+func (c *Client) SnapshotUp(ctx context.Context, mkt Market, now time.Time, maxAge time.Duration) (strategy.Quote, error) {
+	if q, err := c.SnapshotCached(mkt, now, maxAge); err == nil {
 		return q, nil
 	}
+	q := strategy.Quote{TokenUp: mkt.TokenUp, TokenDown: mkt.TokenDown}
 	bid, ask, err := c.RESTBook(ctx, mkt.TokenUp)
 	if err == nil {
 		q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, now, "rest_clob"

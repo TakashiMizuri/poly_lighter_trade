@@ -474,6 +474,8 @@ type Stats struct {
 	P90LagMS      float64  `json:"p90_lag_ms"`
 	P50FillLagMS  float64  `json:"p50_fill_lag_ms"`
 	P90FillLagMS  float64  `json:"p90_fill_lag_ms"`
+	MeanFillLagMS float64  `json:"mean_fill_lag_ms"`
+	NFillLag      int      `json:"n_fill_lag"`
 	NClockSkip    int      `json:"n_clock_skip"`
 	NSL           int      `json:"n_sl"`
 }
@@ -511,20 +513,30 @@ WHERE lighter_entry_px IS NOT NULL AND ret_bps IS NOT NULL AND shadow_ret_bps IS
 	}
 	st.P50LagMS = percentile(s, ctx, "entry_lag_ms", 0.50)
 	st.P90LagMS = percentile(s, ctx, "entry_lag_ms", 0.90)
-	st.P50FillLagMS = percentile(s, ctx, "fill_lag_ms", 0.50)
-	st.P90FillLagMS = percentile(s, ctx, "fill_lag_ms", 0.90)
+	const tradeLag = `side IN ('long','short') AND lighter_entry_px IS NOT NULL AND fill_lag_ms IS NOT NULL`
+	var meanLag sql.NullFloat64
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1), AVG(fill_lag_ms) FROM windows WHERE `+tradeLag).Scan(&st.NFillLag, &meanLag)
+	if meanLag.Valid {
+		st.MeanFillLagMS = meanLag.Float64
+	}
+	st.P50FillLagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.50)
+	st.P90FillLagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.90)
 	return st, nil
 }
 
 func percentile(s *Store, ctx context.Context, col string, p float64) float64 {
+	return percentileWhere(s, ctx, col, col+` IS NOT NULL`, p)
+}
+
+func percentileWhere(s *Store, ctx context.Context, col, where string, p float64) float64 {
 	var n int
-	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(`+col+`) FROM windows WHERE `+col+` IS NOT NULL`).Scan(&n)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE `+where).Scan(&n)
 	if n == 0 {
 		return 0
 	}
 	off := int(float64(n-1) * p)
 	var v float64
-	q := fmt.Sprintf(`SELECT %s FROM windows WHERE %s IS NOT NULL ORDER BY %s LIMIT 1 OFFSET %d`, col, col, col, off)
+	q := fmt.Sprintf(`SELECT %s FROM windows WHERE %s ORDER BY %s LIMIT 1 OFFSET %d`, col, where, col, off)
 	_ = s.DB.QueryRowContext(ctx, q).Scan(&v)
 	return v
 }

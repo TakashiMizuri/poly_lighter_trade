@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { LogOutIcon } from "lucide-react";
 import { Line, LineChart, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis } from "recharts";
 import {
@@ -29,9 +29,64 @@ function utc(ts: number) {
   return new Date(ts * 1000).toISOString().replace(".000Z", "Z");
 }
 
+function hhmm(ts: number) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toISOString().slice(11, 16) + "Z";
+}
+
 function signedMs(n: number | null | undefined) {
   if (n == null || Number.isNaN(n)) return "—";
   return `${n >= 0 ? "+" : ""}${n.toFixed(0)} ms`;
+}
+
+function ms(n: number | null | undefined) {
+  if (n == null || Number.isNaN(n)) return "—";
+  return `${n.toFixed(0)} ms`;
+}
+
+function isTrade(w: WindowRow) {
+  return w.side === "long" || w.side === "short";
+}
+
+/** Лаг только у входов: open 5m UTC → timestamp ордера/fill на Lighter. */
+function tradeLag(w: WindowRow): number | null {
+  if (!isTrade(w)) return null;
+  return num(w.fill_lag_ms);
+}
+
+function skipLabel(reason: string) {
+  const map: Record<string, string> = {
+    below_th: "ниже порога 0.65",
+    both_ge_th: "обе стороны ≥ 0.65",
+    late: "позже T+2 с",
+    clock: "часы хоста",
+    no_market: "нет рынка PM",
+    bad_quote: "нет живой котировки",
+    stale_quote: "котировка устарела",
+    quote_incoherent: "котировка Up/Down не сходится",
+    halt: "HALT",
+    equity_too_small: "мало equity / лот",
+    flatten_busy: "не flat",
+    order_failed: "ордер не ушёл",
+    entry_unfilled_after_send: "ордер без fill",
+    stop_missing: "стоп не встал",
+    equity: "нет equity",
+    no_px: "нет цены BTC",
+  };
+  return map[reason] || reason;
+}
+
+function sideBadge(side: string) {
+  if (side === "long") return <Badge>LONG</Badge>;
+  if (side === "short") return <Badge variant="outline">SHORT</Badge>;
+  return <Badge variant="secondary">skip</Badge>;
+}
+
+function pnlClass(n: number | null) {
+  if (n == null) return "";
+  if (n > 0) return "text-emerald-700";
+  if (n < 0) return "text-red-700";
+  return "";
 }
 
 export default function Dashboard({ onLogout }: { onLogout: () => void }) {
@@ -98,6 +153,27 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
 
   const halted = Boolean(status?.kill_switch || status?.halted);
   const clockBad = Boolean(status && status.clock_ok && Math.abs(status.clock_offset_ms) > 1000);
+  const skipMix = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const w of windows) {
+      if (w.side !== "skip") continue;
+      const k = w.skip_reason || "skip";
+      m.set(k, (m.get(k) || 0) + 1);
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  }, [windows]);
+  const lagSeries = useMemo(
+    () =>
+      [...trades]
+        .filter((w) => tradeLag(w) != null)
+        .slice(0, 40)
+        .reverse()
+        .map((w) => ({ ts: w.window_ts, lag: tradeLag(w) as number })),
+    [trades],
+  );
+  const lastTrade = trades[0];
+  const signal =
+    status && status.p_up >= 0.65 ? "вход LONG" : status && 1 - status.p_up >= 0.65 ? "вход SHORT" : "обычно skip";
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-7xl flex-col">
@@ -106,7 +182,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
           <div className="font-heading text-sm font-medium">POLY_LIGHTER_1</div>
           <div className="truncate text-xs text-muted-foreground">
             {status
-              ? `${status.instance_name} · ${status.network}${status.dry_run ? " · DRY" : ""} · ${fmt(status.leverage, 1)}x · frac ${fmt(status.equity_fraction, 2)} · ${status.state}`
+              ? `${status.instance_name} · ${status.network}${status.dry_run ? " · DRY" : ""} · BTC perp ${fmt(status.leverage, 1)}× · ${status.state}`
               : "загрузка…"}
           </div>
         </div>
@@ -134,152 +210,263 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
         <Tabs value={tab} onValueChange={setTab} className="flex-1">
           <TabsList className="mx-4 mt-3 grid w-auto grid-cols-6">
             <TabsTrigger value="overview">Обзор</TabsTrigger>
-            <TabsTrigger value="clock">Часы</TabsTrigger>
-            <TabsTrigger value="windows">Окна</TabsTrigger>
             <TabsTrigger value="trades">Сделки</TabsTrigger>
-            <TabsTrigger value="exec">Исполнение</TabsTrigger>
-            <TabsTrigger value="health">Health</TabsTrigger>
+            <TabsTrigger value="windows">Окна</TabsTrigger>
+            <TabsTrigger value="exec">Ордера</TabsTrigger>
+            <TabsTrigger value="clock">Часы</TabsTrigger>
+            <TabsTrigger value="health">Журнал</TabsTrigger>
           </TabsList>
 
           <TabsContent value="overview" className="space-y-3 p-4">
-            <Venues />
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Stat label="Equity Lighter" value={`$${fmt(status.equity)}`} hint="Живой счёт, не тень" />
-              <Stat label="Peak / shadow" value={`$${fmt(status.peak_equity)} / $${fmt(status.shadow_equity)}`} />
-              <Stat label="PM p_up / p_down" value={`${fmt(status.p_up, 3)} / ${fmt(status.p_down, 3)}`} hint="Сигнал Polymarket. Вход если ≥0.65 или ≤0.35" />
-              <Stat label="PM spread" value={fmt(status.spread, 3)} />
-              <Stat label="Coverage" value={`${fmt((stats?.coverage ?? 0) * 100, 1)}%`} />
-              <Stat label="WR live" value={`${fmt((stats?.wr ?? 0) * 100, 1)}%`} />
-              <Stat label="mean bps live" value={fmt(stats?.mean_bps, 2)} hint="Lighter fill → exit" />
-              <Stat label="mean bps тень Binance" value={fmt(stats?.shadow_mean_bps, 2)} hint="T+1s 1s-close → 5m close, не Lighter" />
-              <Stat label="gap live − тень" value={fmt(stats?.gap_bps, 2)} />
-              <Stat label="соответствие" value={stats?.match_coef == null ? "—" : fmt(stats.match_coef, 2)} />
-              <Stat label="n trades / skip clock / SL" value={`${stats?.n_trades ?? 0} / ${stats?.n_clock_skip ?? 0} / ${stats?.n_sl ?? 0}`} />
-              <Stat label="p50 fill lag" value={`${fmt(stats?.p50_fill_lag_ms, 0)} ms`} hint="От open окна UTC до fill Lighter" />
+            <div className="grid gap-3 lg:grid-cols-3">
+              <Card>
+                <CardHeader className="pb-1">
+                  <CardTitle className="text-xs font-normal text-muted-foreground">Текущее 5m окно UTC</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-1">
+                  <div className="text-lg font-medium">{utc(status.window_ts)}</div>
+                  <p className="text-xs text-muted-foreground">
+                    {fmt(status.secs_into_window, 0)} с от open · до close {fmt(status.secs_to_close, 0)} с
+                  </p>
+                  <p className="text-xs">
+                    Позиция Lighter: <b>{status.position}</b>
+                    {status.entry_px ? ` @ ${fmt(status.entry_px)}` : ""}
+                    {status.stop_px ? ` · стоп ${fmt(status.stop_px)}` : ""}
+                  </p>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-1">
+                  <CardTitle className="text-xs font-normal text-muted-foreground">Сигнал Polymarket (не торгуем здесь)</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-1">
+                  <div className="text-lg font-medium">
+                    Up {fmt(status.p_up, 3)} · Down {fmt(status.p_down, 3)}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {signal} · порог 0.65 · спред {fmt(status.spread, 3)} · {status.quote_source || "нет котировки"} · age{" "}
+                    {fmt(status.quote_age_ms, 0)} ms
+                  </p>
+                  <p className="text-xs text-muted-foreground">Последний skip: {status.last_skip ? skipLabel(status.last_skip) : "—"}</p>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-1">
+                  <CardTitle className="text-xs font-normal text-muted-foreground">Лаг входа :00 → ордер Lighter</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-1">
+                  <div className="text-lg font-medium">{stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"}</div>
+                  <p className="text-xs text-muted-foreground">
+                    Среднее по {stats?.n_fill_lag ?? 0} входам. Skip без ордера не входят.
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    p50 {ms(stats?.p50_fill_lag_ms)} · p90 {ms(stats?.p90_fill_lag_ms)} · timestamp ордера на бирже минус
+                    open окна UTC
+                  </p>
+                </CardContent>
+              </Card>
             </div>
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">Equity live (Lighter) vs shadow (Binance T+1s)</CardTitle>
-              </CardHeader>
-              <CardContent className="h-48">
-                {equity.length < 2 ? (
-                  <div className="text-sm text-muted-foreground">Мало точек</div>
-                ) : (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={equity}>
-                      <XAxis dataKey="ts" hide />
-                      <YAxis domain={["auto", "auto"]} width={48} />
-                      <RTooltip />
-                      <Line type="monotone" dataKey="live" stroke="#111" dot={false} strokeWidth={1.5} />
-                      <Line type="monotone" dataKey="shadow" stroke="#888" dot={false} strokeWidth={1} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                )}
-              </CardContent>
-            </Card>
-            <div className="flex gap-2">
+
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Stat label="Equity Lighter" value={`$${fmt(status.equity)}`} hint="Живой счёт" />
+              <Stat label="Пик / тень Binance" value={`$${fmt(status.peak_equity)} / $${fmt(status.shadow_equity)}`} hint="Тень — research T+1s, не Lighter" />
+              <Stat label="Сделки / skip" value={`${stats?.n_trades ?? 0} / ${stats?.n_skip ?? 0}`} hint={`окон ${stats?.n_windows ?? 0} · покрытие котировкой ${fmt((stats?.coverage ?? 0) * 100, 1)}%`} />
+              <Stat label="WR live" value={`${fmt((stats?.wr ?? 0) * 100, 1)}%`} hint={`mean ${fmt(stats?.mean_bps, 1)} bps · SL ${stats?.n_sl ?? 0}`} />
+              <Stat label="Тень mean bps" value={fmt(stats?.shadow_mean_bps, 1)} hint="Binance 1s T+1 → 5m close" />
+              <Stat label="gap live − тень" value={fmt(stats?.gap_bps, 1)} hint={stats?.match_coef == null ? "мало пар" : `live/тень ${fmt(stats.match_coef, 2)}`} />
+              <Stat
+                label="Последний вход"
+                value={lastTrade ? `${lastTrade.side.toUpperCase()} ${ms(tradeLag(lastTrade))}` : "пока нет"}
+                hint={lastTrade ? `${utc(lastTrade.window_ts)} · ${fmt(num(lastTrade.lighter_entry_px), 1)}` : "лаг появится после первой сделки"}
+              />
+              <Stat label="Стоп" value={`${fmt(status.stop_price_pct * 100, 3)}% цены BTC`} hint="Reduce-only, не % депозита" />
+            </div>
+
+            <div className="grid gap-3 lg:grid-cols-2">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Equity live vs тень Binance</CardTitle>
+                </CardHeader>
+                <CardContent className="h-48">
+                  {equity.length < 2 ? (
+                    <div className="text-sm text-muted-foreground">Мало точек — кривая появится после окон</div>
+                  ) : (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={equity}>
+                        <XAxis dataKey="ts" hide />
+                        <YAxis domain={["auto", "auto"]} width={48} />
+                        <RTooltip />
+                        <Line type="monotone" dataKey="live" stroke="#111" dot={false} strokeWidth={1.5} name="Lighter" />
+                        <Line type="monotone" dataKey="shadow" stroke="#888" dot={false} strokeWidth={1} name="тень" />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  )}
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Лаг входов, ms (только сделки)</CardTitle>
+                </CardHeader>
+                <CardContent className="h-48">
+                  {lagSeries.length < 2 ? (
+                    <div className="text-sm text-muted-foreground">Нужны минимум две сделки с timestamp ордера</div>
+                  ) : (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={lagSeries}>
+                        <XAxis dataKey="ts" tickFormatter={(v) => hhmm(Number(v))} minTickGap={24} />
+                        <YAxis domain={["auto", "auto"]} width={40} />
+                        <RTooltip formatter={(v) => [`${Number(v).toFixed(0)} ms`, "лаг"]} labelFormatter={(l) => utc(Number(l))} />
+                        <Line type="monotone" dataKey="lag" stroke="#111" dot={false} strokeWidth={1.5} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  )}
+                </CardContent>
+              </Card>
+            </div>
+
+            <div className="grid gap-3 lg:grid-cols-2">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Почему skip</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  {skipMix.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">Пока нет пропусков</p>
+                  ) : (
+                    <ul className="space-y-1 text-sm">
+                      {skipMix.map(([k, n]) => (
+                        <li key={k} className="flex justify-between gap-3">
+                          <span>{skipLabel(k)}</span>
+                          <span className="text-muted-foreground">{n}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Последние окна</CardTitle>
+                </CardHeader>
+                <CardContent className="overflow-x-auto">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>open</TableHead>
+                        <TableHead>сторона</TableHead>
+                        <TableHead>p_up</TableHead>
+                        <TableHead>лаг</TableHead>
+                        <TableHead>итог</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {windows.slice(0, 8).map((w) => (
+                        <TableRow key={w.window_ts}>
+                          <TableCell className="text-xs">{hhmm(w.window_ts)}</TableCell>
+                          <TableCell>{sideBadge(w.side)}</TableCell>
+                          <TableCell>{fmt(w.p_up, 3)}</TableCell>
+                          <TableCell>{ms(tradeLag(w))}</TableCell>
+                          <TableCell className={`text-xs ${pnlClass(num(w.pnl_usd))}`}>
+                            {isTrade(w) ? (num(w.pnl_usd) != null ? `$${fmt(num(w.pnl_usd), 2)}` : w.exit_reason || "open") : skipLabel(w.skip_reason)}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </CardContent>
+              </Card>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
               <Button variant="destructive" disabled={busy} onClick={() => void kill()}>
                 Kill / flatten
               </Button>
               <Button variant="outline" disabled={busy} onClick={() => void resume()}>
                 Resume
               </Button>
+              <span className="text-xs text-muted-foreground">
+                Три площадки: PM = сигнал, Lighter = сделки, Binance = UTC и тень research.
+              </span>
             </div>
+          </TabsContent>
+
+          <TabsContent value="trades" className="space-y-3 p-4">
             <p className="text-xs text-muted-foreground">
-              Позиция Lighter: {status.position}
-              {status.entry_px ? ` @ ${fmt(status.entry_px)}` : ""}
-              {status.stop_px ? ` · stop ${fmt(status.stop_px)} (${fmt(status.stop_price_pct * 100, 3)}% цены BTC)` : ""}
-              · PM quote {status.quote_source || "—"} age {fmt(status.quote_age_ms, 0)} ms · last skip {status.last_skip || "—"}
+              Только окна, в которые бот вошёл. Лаг = timestamp ордера на Lighter минус :00 окна UTC. Skip здесь нет.
             </p>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Stat label="Средний лаг" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} />
+              <Stat label="p50 / p90" value={`${ms(stats?.p50_fill_lag_ms)} / ${ms(stats?.p90_fill_lag_ms)}`} />
+              <Stat label="n с лагом" value={String(stats?.n_fill_lag ?? 0)} />
+              <Stat label="WR / mean bps" value={`${fmt((stats?.wr ?? 0) * 100, 1)}% / ${fmt(stats?.mean_bps, 1)}`} />
+            </div>
+            <WindowTable rows={trades} tradesOnly />
+          </TabsContent>
+
+          <TabsContent value="windows" className="p-4">
+            <p className="mb-2 text-xs text-muted-foreground">
+              Каждое 5m окно. Колонка лага пустая на skip — ордера не было, это не «медленный вход».
+            </p>
+            <WindowTable rows={windows} />
+          </TabsContent>
+
+          <TabsContent value="exec" className="space-y-3 p-4">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Stat label="Средний лаг входов" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} hint="Только long/short с timestamp биржи" />
+              <Stat label="p50 / p90 лаг" value={`${ms(stats?.p50_fill_lag_ms)} / ${ms(stats?.p90_fill_lag_ms)}`} />
+              <Stat label="paired live/тень" value={String(stats?.n_paired ?? 0)} />
+              <Stat label="выходы по SL" value={String(stats?.n_sl ?? 0)} />
+            </div>
+            {orders.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Ордеров ещё нет</p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>окно UTC</TableHead>
+                    <TableHead>kind</TableHead>
+                    <TableHead>status</TableHead>
+                    <TableHead>qty</TableHead>
+                    <TableHead>px</TableHead>
+                    <TableHead>client idx</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {orders.slice(0, 60).map((o) => (
+                    <TableRow key={o.id}>
+                      <TableCell className="text-xs">{utc(o.window_ts)}</TableCell>
+                      <TableCell>{o.kind}</TableCell>
+                      <TableCell>{o.status}</TableCell>
+                      <TableCell>{fmt(o.qty, 5)}</TableCell>
+                      <TableCell>{fmt(o.price, 1)}</TableCell>
+                      <TableCell className="text-xs">{o.client_order_index}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
           </TabsContent>
 
           <TabsContent value="clock" className="space-y-3 p-4">
             <Alert variant={clockBad ? "destructive" : "default"}>
-              <AlertTitle>Сетка окна = UTC, не Lighter</AlertTitle>
+              <AlertTitle>Сетка окон = UTC. Лаг входа — это не эти часы.</AlertTitle>
               <AlertDescription>
-                Сделка на Lighter, сигнал на Polymarket. Binance /api/v3/time — только проверка, что хост не уехал от UTC (slug окна
-                btc-updown-5m-{"{ts}"}). Это не лаг исполнения на Lighter.
+                Binance time только проверяет, что VPS не уехал от UTC (slug btc-updown-5m-ts). Лаг сделки считается отдельно:
+                время ордера на Lighter минус open окна.
               </AlertDescription>
             </Alert>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <Stat
                 label="offset Binance − host"
-                value={status.clock_ok ? signedMs(status.clock_offset_ms) : "нет доверенного замера"}
-                hint="Плюс = Binance впереди VPS. Skip clock если |offset| > 1000 ms и RTT нормальный"
+                value={status.clock_ok ? signedMs(status.clock_offset_ms) : "нет замера"}
+                hint="Плюс = Binance впереди VPS"
               />
-              <Stat label="RTT замера Binance" value={`${fmt(status.clock_rtt_ms, 0)} ms`} hint="Если >800 ms замер выкидывается — это сеть, не часы" />
+              <Stat label="RTT замера" value={ms(status.clock_rtt_ms)} hint=">800 ms — сеть, замер выкидывается" />
               <Stat label="замер доверенный" value={status.clock_ok ? "да" : "нет"} />
-              <Stat label="окно UTC" value={utc(status.window_ts)} />
-              <Stat label="секунда в окне" value={`${fmt(status.secs_into_window, 1)} / 300`} />
-              <Stat label="до close окна" value={`${fmt(status.secs_to_close, 1)} s`} />
-              <Stat label="порог входа T+2" value="2000 ms" hint="entry_lag = decision − window_ts" />
-              <Stat label="стоп % цены BTC" value={`${fmt(status.stop_price_pct * 100, 3)}%`} hint="Не % депозита, не × leverage" />
+              <Stat label="дедлайн входа" value="T+2.0 с" hint="Если к ts+2 нет ордера — skip late" />
             </div>
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">Три площадки — не путать лаги</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2 text-sm text-muted-foreground">
-                <p>
-                  <b className="text-foreground">Polymarket</b> — только сигнал: mid Up на open 5m. p_up / spread / quote_source / quote_age.
-                </p>
-                <p>
-                  <b className="text-foreground">Lighter</b> — только исполнение: entry/exit px, qty, стоп, PnL, fill_lag (отправка→fill).
-                </p>
-                <p>
-                  <b className="text-foreground">Binance</b> — часы UTC (serverTime) и тень research (1s T+1 → 5m close). Не место сделки.
-                </p>
-                <p>
-                  Skip <code>clock</code> = бот решил, что хост слишком далеко от Binance time. Не значит «Lighter тормозит».
-                  Колонка lag в окнах: entry_lag или fill_lag от <b>open UTC</b>, не detect_lag Donchian.
-                </p>
-              </CardContent>
-            </Card>
           </TabsContent>
 
-          <TabsContent value="windows" className="p-4">
-            <p className="mb-2 text-xs text-muted-foreground">
-              Горизонтальный скролл. clock_ms — замер Binance в момент окна. entry/fill lag — от ts UTC.
-            </p>
-            <WindowTable rows={windows} />
-          </TabsContent>
-          <TabsContent value="trades" className="p-4">
-            <WindowTable rows={trades} tradesOnly />
-          </TabsContent>
-          <TabsContent value="exec" className="space-y-3 p-4">
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Stat label="gap live − тень bps" value={fmt(stats?.gap_bps, 2)} />
-              <Stat label="live/тень" value={stats?.match_coef == null ? "—" : fmt(stats.match_coef, 2)} />
-              <Stat label="p50 / p90 entry lag" value={`${fmt(stats?.p50_lag_ms, 0)} / ${fmt(stats?.p90_lag_ms, 0)}`} />
-              <Stat label="p50 / p90 fill lag" value={`${fmt(stats?.p50_fill_lag_ms, 0)} / ${fmt(stats?.p90_fill_lag_ms, 0)}`} />
-              <Stat label="n paired" value={String(stats?.n_paired ?? 0)} />
-              <Stat label="n SL" value={String(stats?.n_sl ?? 0)} />
-            </div>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>окно UTC</TableHead>
-                  <TableHead>kind</TableHead>
-                  <TableHead>status</TableHead>
-                  <TableHead>qty</TableHead>
-                  <TableHead>px</TableHead>
-                  <TableHead>client idx</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {orders.slice(0, 60).map((o) => (
-                  <TableRow key={o.id}>
-                    <TableCell className="text-xs">{utc(o.window_ts)}</TableCell>
-                    <TableCell>{o.kind}</TableCell>
-                    <TableCell>{o.status}</TableCell>
-                    <TableCell>{fmt(o.qty, 5)}</TableCell>
-                    <TableCell>{fmt(o.price, 1)}</TableCell>
-                    <TableCell className="text-xs">{o.client_order_index}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </TabsContent>
           <TabsContent value="health" className="space-y-3 p-4">
             <Alert variant={halted ? "destructive" : "default"}>
               <AlertTitle>{halted ? "HALT" : "OK"}</AlertTitle>
@@ -290,7 +477,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
             </Alert>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               <Stat label="symbol" value={status.symbol} />
-              <Stat label="threshold PM" value={fmt(status.threshold, 2)} />
+              <Stat label="порог PM" value={fmt(status.threshold, 2)} />
               <Stat label="leverage × fraction" value={`${fmt(status.leverage, 1)} × ${fmt(status.equity_fraction, 2)}`} />
             </div>
             <Table>
@@ -320,25 +507,6 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
   );
 }
 
-function Venues() {
-  return (
-    <div className="grid gap-2 text-xs sm:grid-cols-3">
-      <div className="rounded-md border p-2">
-        <div className="font-medium">1. Polymarket</div>
-        <div className="text-muted-foreground">Сигнал 5m Up/Down. Мы здесь не торгуем.</div>
-      </div>
-      <div className="rounded-md border p-2">
-        <div className="font-medium">2. Lighter</div>
-        <div className="text-muted-foreground">BTC perp: вход, стоп 0.125% цены, выход. Живой PnL.</div>
-      </div>
-      <div className="rounded-md border p-2">
-        <div className="font-medium">3. Binance</div>
-        <div className="text-muted-foreground">Прокси UTC + тень T+1s. Не биржа бота.</div>
-      </div>
-    </div>
-  );
-}
-
 function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <Card>
@@ -354,25 +522,25 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
 }
 
 function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boolean }) {
+  if (rows.length === 0) {
+    return <p className="text-sm text-muted-foreground">{tradesOnly ? "Сделок ещё нет" : "Окон ещё нет"}</p>;
+  }
   return (
     <div className="overflow-x-auto">
       <Table>
         <TableHeader>
           <TableRow>
             <TableHead>окно UTC</TableHead>
-            <TableHead>side</TableHead>
-            <TableHead>exit</TableHead>
+            <TableHead>сторона</TableHead>
+            <TableHead>выход</TableHead>
             <TableHead>p_up</TableHead>
-            <TableHead>spread</TableHead>
-            <TableHead>src</TableHead>
-            <TableHead>skip</TableHead>
-            <TableHead>entry lag</TableHead>
-            <TableHead>fill lag</TableHead>
-            <TableHead>clock ms</TableHead>
-            <TableHead>clock rtt</TableHead>
+            <TableHead>спред</TableHead>
+            <TableHead>котировка</TableHead>
+            {!tradesOnly ? <TableHead>skip</TableHead> : null}
+            <TableHead>лаг :00→ордер</TableHead>
             <TableHead>Lighter in</TableHead>
             <TableHead>Lighter out</TableHead>
-            <TableHead>stop</TableHead>
+            <TableHead>стоп</TableHead>
             {tradesOnly ? <TableHead>pnl</TableHead> : null}
             {tradesOnly ? <TableHead>ret bps</TableHead> : null}
             {tradesOnly ? <TableHead>тень bps</TableHead> : null}
@@ -383,20 +551,17 @@ function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boo
           {rows.slice(0, 80).map((w) => (
             <TableRow key={w.window_ts}>
               <TableCell className="whitespace-nowrap text-xs">{utc(w.window_ts)}</TableCell>
-              <TableCell>{w.side}</TableCell>
+              <TableCell>{sideBadge(w.side)}</TableCell>
               <TableCell className="text-xs">{w.exit_reason || "—"}</TableCell>
               <TableCell>{fmt(w.p_up, 3)}</TableCell>
               <TableCell>{fmt(w.spread, 3)}</TableCell>
               <TableCell className="text-xs">{w.quote_source || "—"}</TableCell>
-              <TableCell className="text-xs">{w.skip_reason || "—"}</TableCell>
-              <TableCell>{fmt(num(w.entry_lag_ms), 0)}</TableCell>
-              <TableCell>{fmt(num(w.fill_lag_ms), 0)}</TableCell>
-              <TableCell>{fmt(num(w.clock_offset_ms), 0)}</TableCell>
-              <TableCell>{fmt(num(w.clock_rtt_ms), 0)}</TableCell>
+              {!tradesOnly ? <TableCell className="text-xs">{w.skip_reason ? skipLabel(w.skip_reason) : "—"}</TableCell> : null}
+              <TableCell>{ms(tradeLag(w))}</TableCell>
               <TableCell className="text-xs">{fmt(num(w.lighter_entry_px), 1)}</TableCell>
               <TableCell className="text-xs">{fmt(num(w.lighter_exit_px), 1)}</TableCell>
               <TableCell className="text-xs">{fmt(num(w.stop_px), 1)}</TableCell>
-              {tradesOnly ? <TableCell>{fmt(num(w.pnl_usd), 2)}</TableCell> : null}
+              {tradesOnly ? <TableCell className={pnlClass(num(w.pnl_usd))}>{fmt(num(w.pnl_usd), 2)}</TableCell> : null}
               {tradesOnly ? <TableCell>{fmt(num(w.ret_bps), 1)}</TableCell> : null}
               {tradesOnly ? <TableCell>{fmt(num(w.shadow_ret_bps), 1)}</TableCell> : null}
               {tradesOnly ? <TableCell>{fmt(num(w.sl_slip_bps), 1)}</TableCell> : null}

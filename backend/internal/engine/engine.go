@@ -72,6 +72,10 @@ type Engine struct {
 	started     time.Time
 	global      store.GlobalState
 	bootWindow  int64
+	consumedTS  int64
+	readyEq     float64
+	readyPx     float64
+	readyAt     time.Time
 }
 
 func New(cfg *config.Config, st *store.Store, httpClient *lighter.HTTPClient, signer *lighter.Signer, markets map[string]lighter.MarketMeta, pm *polymarket.Client, bn *binance.Client, n notify.Notifier, log *slog.Logger) *Engine {
@@ -195,7 +199,7 @@ func (e *Engine) tick(ctx context.Context) error {
 		return e.waitNextOpen(ctx, ts+clock.WindowSec)
 	}
 
-	if now.Unix()-ts >= int64(e.Cfg.EntryMaxLag.Seconds()) {
+	if e.now().Sub(time.Unix(ts, 0).UTC()) >= e.Cfg.EntryMaxLag {
 		return e.waitNextOpen(ctx, ts+clock.WindowSec)
 	}
 
@@ -215,19 +219,61 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 			return err
 		}
 	}
-	// Binance clock only if we still have time before open. Never stall :00 for NTP.
-	probes := 3
-	if !e.now().Before(time.Unix(next, 0).UTC().Add(-3 * time.Second)) {
-		probes = 0
+	open := time.Unix(next, 0).UTC()
+	probes := 0
+	if e.now().Before(open.Add(-3 * time.Second)) {
+		probes = 3
 	}
 	if err := e.arm(ctx, next, probes); err != nil {
 		e.Log.Warn("arm", "err", err, "ts", next)
 	}
-	open := time.Unix(next, 0).UTC()
+	_ = e.refreshReady(ctx)
+	for e.now().Before(open.Add(-400 * time.Millisecond)) {
+		_ = e.refreshReady(ctx)
+		wake := e.now().Add(time.Second)
+		if wake.After(open.Add(-400 * time.Millisecond)) {
+			wake = open.Add(-400 * time.Millisecond)
+		}
+		if err := clock.SleepUntil(ctx, wake, e.now); err != nil {
+			return err
+		}
+	}
+	e.mu.Lock()
+	mkt := e.armedMarket
+	e.mu.Unlock()
+	if e.now().Before(open.Add(-80 * time.Millisecond)) {
+		wctx, cancel := context.WithDeadline(ctx, open.Add(-50*time.Millisecond))
+		if e.PM != nil {
+			e.PM.WarmREST(wctx, mkt)
+		}
+		if e.HTTP != nil {
+			_, _ = e.HTTP.GetNextNonce(e.Cfg.AccountIndex, e.Cfg.APIKeyIndex)
+		}
+		cancel()
+	}
 	if err := clock.SleepUntil(ctx, open, e.now); err != nil {
 		return err
 	}
 	return e.decide(ctx, next)
+}
+
+func (e *Engine) refreshReady(ctx context.Context) error {
+	eq, err := e.equity(ctx)
+	if err != nil {
+		return err
+	}
+	px, err := e.btcPx(ctx)
+	if err != nil || px <= 0 {
+		return err
+	}
+	flat, _ := e.isFlat(ctx)
+	e.mu.Lock()
+	e.readyEq, e.readyPx, e.readyAt = eq, px, time.Now()
+	e.mu.Unlock()
+	if !flat && !e.Cfg.DryRun {
+		_ = e.ensureFlat(ctx, "prewarm")
+	}
+	return nil
 }
 
 func (e *Engine) arm(ctx context.Context, ts int64, clockProbes int) error {
@@ -253,6 +299,7 @@ func (e *Engine) arm(ctx context.Context, ts int64, clockProbes int) error {
 	e.armedMarket = mkt
 	e.mu.Unlock()
 	e.PM.Arm(ts, mkt)
+	go e.PM.WarmREST(context.Background(), mkt)
 	e.Log.Info("armed", "ts", ts, "slug", slug)
 	return nil
 }
@@ -284,36 +331,42 @@ func (e *Engine) stampClock(w *store.Window) {
 	w.ClockRTTMS = sql.NullFloat64{Float64: rtt.Seconds() * 1000, Valid: true}
 }
 
+func (e *Engine) saveWindow(ctx context.Context, w store.Window) {
+	if err := e.Store.InsertWindow(ctx, w); err != nil {
+		_ = e.Store.UpdateWindow(ctx, w)
+	}
+}
+
 func (e *Engine) decide(ctx context.Context, ts int64) error {
 	e.setState(StateDecide)
+	if e.consumedTS == ts {
+		return e.sleepToExit(ctx, ts)
+	}
 	exists, err := e.Store.HasWindow(ctx, ts)
 	if err != nil {
 		return err
 	}
 	if exists {
-		e.Log.Info("window already recorded", "ts", ts)
+		e.consumedTS = ts
 		return e.sleepToExit(ctx, ts)
 	}
+	e.consumedTS = ts
 
 	w := store.Window{WindowTS: ts, Side: strategy.SideSkip, State: "decide"}
 	e.stampClock(&w)
-	if err := e.Store.InsertWindow(ctx, w); err != nil {
-		e.Log.Warn("unique window", "err", err)
-		return e.sleepToExit(ctx, ts)
-	}
 
 	if e.isHalted() {
 		return e.finishSkip(ctx, w, "halt", "halted")
 	}
 
-	now := e.now()
-	if now.Unix()-ts >= int64(e.Cfg.EntryMaxLag.Seconds()) {
+	if e.now().Sub(time.Unix(ts, 0).UTC()) >= e.Cfg.EntryMaxLag {
 		return e.finishSkip(ctx, w, "late", "past T+2s")
 	}
 
 	e.mu.Lock()
 	mkt := e.armedMarket
 	armed := e.armedFor == ts
+	eq, px := e.readyEq, e.readyPx
 	e.mu.Unlock()
 	if !armed {
 		if err := e.arm(ctx, ts, 0); err != nil {
@@ -323,15 +376,11 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		mkt = e.armedMarket
 		e.mu.Unlock()
 	}
-	if e.offsetOK && absDur(e.offset) > e.Cfg.ClockSkipOffset {
-		e.stampClock(&w)
-		return e.finishSkip(ctx, w, "clock", "clock offset > 1s")
-	}
 	if mkt.TokenUp == "" {
 		return e.finishSkip(ctx, w, "no_market", "empty tokens")
 	}
 
-	q, err := e.PM.SnapshotUp(ctx, mkt, e.now(), time.Second)
+	q, err := e.PM.SnapshotCached(mkt, e.now(), 15*time.Second)
 	if err != nil {
 		return e.finishSkip(ctx, w, "bad_quote", err.Error())
 	}
@@ -366,21 +415,20 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, skipReason, skipReason)
 	}
 
-	if e.now().Unix()-ts >= int64(e.Cfg.EntryMaxLag.Seconds()) {
+	if e.now().Sub(time.Unix(ts, 0).UTC()) >= e.Cfg.EntryMaxLag {
 		return e.finishSkip(ctx, w, "late", "late after quote")
 	}
 
-	if err := e.mustBeFlat(ctx); err != nil {
-		return e.finishSkip(ctx, w, "flatten_busy", err.Error())
-	}
-
-	eq, err := e.equity(ctx)
-	if err != nil {
-		return e.finishSkip(ctx, w, "equity", err.Error())
-	}
-	px, err := e.btcPx(ctx)
-	if err != nil || px <= 0 {
-		return e.finishSkip(ctx, w, "no_px", fmt.Sprintf("%v", err))
+	if eq <= 0 || px <= 0 || time.Since(e.readyAt) > 20*time.Second {
+		var err error
+		eq, err = e.equity(ctx)
+		if err != nil {
+			return e.finishSkip(ctx, w, "equity", err.Error())
+		}
+		px, err = e.btcPx(ctx)
+		if err != nil || px <= 0 {
+			return e.finishSkip(ctx, w, "no_px", fmt.Sprintf("%v", err))
+		}
 	}
 	meta := e.Markets[e.Cfg.Symbol]
 	qty := strategy.FloorLot((eq*e.Cfg.EquityFraction*e.Cfg.Leverage)/px, meta.SizeDecimals)
@@ -410,7 +458,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		w.LighterEntryPx = sql.NullFloat64{Float64: px, Valid: true}
 		w.FillLagMS = sql.NullFloat64{Float64: (e.unix() - float64(ts)) * 1000, Valid: true}
 		w.State = StateInPosition
-		_ = e.Store.UpdateWindow(ctx, w)
+		e.saveWindow(ctx, w)
 		e.setState(StateInPosition)
 		e.flogWindow("entry", w)
 		e.alert(ctx, "info", "entry", fmt.Sprintf("DRY %s qty=%.6f px=%.2f p_up=%.3f", side, qty, px, pUp))
@@ -418,32 +466,24 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 
 	res, err := e.Signer.MarketIOC(e.Cfg.Symbol, buy, qty, px, e.Cfg.MarketSlippage, clientIdx, false)
+	w.State = "sent"
+	e.saveWindow(ctx, w)
 	_ = e.Store.InsertOrder(ctx, ts, "entry", errString(err, "sent"), clientIdx, hashOf(res), qty, px, nil)
 	if err != nil {
 		return e.finishSkip(ctx, w, "order_failed", err.Error())
 	}
-	if e.now().Unix()-ts >= int64(e.Cfg.EntryMaxLag.Seconds()) {
-		// sent but past deadline — still honor fill if any; do not chase more
-	}
 
-	fillPx, fillQty, fee := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, px, 2*time.Second)
+	fillPx, fillQty, fee, fillUnix := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, px, 300*time.Millisecond)
 	if fillPx <= 0 {
 		fillPx = px
 	}
 	if fillQty <= 0 {
-		// trades feed often omits client_order_id; position is the source of truth
-		until := time.Now().Add(1500 * time.Millisecond)
-		for time.Now().Before(until) {
-			flat, p := e.isFlat(ctx)
-			if !flat && p.Size > 0 {
-				fillQty = p.Size
-				if p.AvgEntry > 0 {
-					fillPx = p.AvgEntry
-				}
-				e.Log.Info("fill from position", "qty", fillQty, "px", fillPx, "client", clientIdx)
-				break
+		if flat, p := e.isFlat(ctx); !flat && p.Size > 0 {
+			fillQty = p.Size
+			if p.AvgEntry > 0 {
+				fillPx = p.AvgEntry
 			}
-			time.Sleep(120 * time.Millisecond)
+			e.Log.Info("fill from position", "qty", fillQty, "px", fillPx, "client", clientIdx)
 		}
 	}
 	if fillQty <= 0 {
@@ -454,9 +494,10 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		w.SkipReason = "entry_unfilled_after_send"
 		w.Side = strategy.SideSkip
 		w.ExitReason = "skip"
+		w.FillLagMS = sql.NullFloat64{}
 		e.stampClock(&w)
 		e.bumpLateStreak(ctx, true)
-		_ = e.Store.UpdateWindow(ctx, w)
+		e.saveWindow(ctx, w)
 		e.flogWindow("skip", w)
 		if e.global.LateStreak >= e.Cfg.HaltExitLateStreak {
 			e.halt(ctx, "entry_unfilled_streak")
@@ -468,7 +509,18 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	if usedQty > qty {
 		usedQty = qty
 	}
-	fillTS := e.unix()
+	fillTS := fillUnix
+	octx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
+	if o, err := e.HTTP.OrderByClient(octx, e.Cfg.AccountIndex, clientIdx); err == nil {
+		if u := o.Unix(); u > 0 {
+			fillTS = u
+		}
+	}
+	cancel()
+	var fillLag sql.NullFloat64
+	if fillTS > 0 {
+		fillLag = sql.NullFloat64{Float64: (fillTS - float64(ts)) * 1000, Valid: true}
+	}
 	stopPx := strategy.StopPx(fillPx, side, e.Cfg.StopPricePct)
 	stopIdx := int64(0)
 	if stopPx > 0 {
@@ -494,24 +546,32 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		WindowTS: ts, Side: side, Qty: usedQty, Notional: usedQty * fillPx,
 		EntryPx: fillPx, EntryTS: fillTS, EquityBefore: eq, ClientIdx: clientIdx, Fees: fee,
 		StopClientIdx: stopIdx, StopPx: stopPx,
-		FillLagMS: (e.unix() - float64(ts)) * 1000,
+		FillLagMS: fillLag.Float64,
 	}
 	e.mu.Unlock()
-	w.LighterEntryTS = sql.NullFloat64{Float64: fillTS, Valid: true}
+	entryTS := fillTS
+	if entryTS <= 0 {
+		entryTS = e.unix()
+	}
+	w.LighterEntryTS = sql.NullFloat64{Float64: entryTS, Valid: true}
 	w.LighterEntryPx = sql.NullFloat64{Float64: fillPx, Valid: true}
 	w.Qty = sql.NullFloat64{Float64: usedQty, Valid: true}
 	w.Notional = sql.NullFloat64{Float64: usedQty * fillPx, Valid: true}
 	w.FeesUSD = sql.NullFloat64{Float64: fee, Valid: true}
-	w.FillLagMS = sql.NullFloat64{Float64: (e.unix() - float64(ts)) * 1000, Valid: true}
+	w.FillLagMS = fillLag
 	w.State = StateInPosition
 	if stopPx > 0 {
 		w.StopPx = sql.NullFloat64{Float64: stopPx, Valid: true}
 	}
 	e.stampClock(&w)
-	_ = e.Store.UpdateWindow(ctx, w)
+	e.saveWindow(ctx, w)
 	e.setState(StateInPosition)
 	e.flogWindow("entry", w)
-	e.alert(ctx, "info", "entry", fmt.Sprintf("%s qty=%.6f px=%.2f p_up=%.3f lag=%.0fms", side, usedQty, fillPx, pUp, w.FillLagMS.Float64))
+	lagTxt := "—"
+	if w.FillLagMS.Valid {
+		lagTxt = fmt.Sprintf("%.0fms", w.FillLagMS.Float64)
+	}
+	e.alert(ctx, "info", "entry", fmt.Sprintf("%s qty=%.6f px=%.2f p_up=%.3f lag=%s", side, usedQty, fillPx, pUp, lagTxt))
 	return nil
 }
 
@@ -520,11 +580,12 @@ func (e *Engine) finishSkip(ctx context.Context, w store.Window, reason, msg str
 	w.SkipReason = reason
 	w.ExitReason = "skip"
 	w.State = "skip"
+	w.FillLagMS = sql.NullFloat64{}
 	e.stampClock(&w)
 	if w.DecisionTS == 0 {
 		w.DecisionTS = e.unix()
 	}
-	_ = e.Store.UpdateWindow(ctx, w)
+	e.saveWindow(ctx, w)
 	e.mu.Lock()
 	e.lastSkip = reason
 	e.lastWindow = w.WindowTS
@@ -556,7 +617,7 @@ func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string)
 	deadline := time.Unix(pos.WindowTS, 0).UTC().Add(300 * time.Second)
 	px, fee := 0.0, 0.0
 	if reason == "stop" {
-		px, qty, stopFee := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, e.Markets[e.Cfg.Symbol].MarketID, pos.StopClientIdx, 0, 600*time.Millisecond)
+		px, qty, stopFee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, e.Markets[e.Cfg.Symbol].MarketID, pos.StopClientIdx, 0, 600*time.Millisecond)
 		fee = stopFee
 		if px > 0 && qty > 0 {
 			_ = e.Store.InsertOrder(ctx, pos.WindowTS, "stop_loss_fill", "filled", pos.StopClientIdx, "", qty, px, map[string]any{"stop_px": pos.StopPx, "sl_slip_bps": strategy.SLSlipBps(pos.EntryPx, px, pos.Side, e.Cfg.StopPricePct)})
@@ -674,7 +735,7 @@ func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64
 		return 0, 0, err
 	}
 	meta := e.Markets[e.Cfg.Symbol]
-	fillPx, _, fillFee := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, idx, ref, 800*time.Millisecond)
+	fillPx, _, fillFee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, idx, ref, 800*time.Millisecond)
 	if fillPx <= 0 {
 		fillPx = ref
 	}
@@ -796,13 +857,15 @@ func (e *Engine) fillShadow(ctx context.Context, ts int64) error {
 
 func (e *Engine) nextClientIdx(ctx context.Context) int64 {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.global.ClientOrderSeq == 0 {
 		e.global.ClientOrderSeq = time.Now().UnixMilli() % 1_000_000_000
 	}
 	e.global.ClientOrderSeq++
-	_ = e.Store.SaveGlobal(ctx, e.global)
-	return e.global.ClientOrderSeq
+	seq := e.global.ClientOrderSeq
+	g := e.global
+	e.mu.Unlock()
+	go func() { _ = e.Store.SaveGlobal(context.Background(), g) }()
+	return seq
 }
 
 func (e *Engine) bumpLateStreak(ctx context.Context, bad bool) {

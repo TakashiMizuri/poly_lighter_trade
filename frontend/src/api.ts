@@ -55,6 +55,8 @@ export type Stats = {
   p90_lag_ms: number;
   p50_fill_lag_ms: number;
   p90_fill_lag_ms: number;
+  mean_fill_lag_ms: number;
+  n_fill_lag: number;
   n_clock_skip: number;
   n_sl: number;
 };

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -27,8 +28,21 @@ type HTTPClient struct {
 
 func NewHTTP(baseURL string) *HTTPClient {
 	return &HTTPClient{
-		BaseURL:     strings.TrimRight(baseURL, "/"),
-		HTTP:        &http.Client{Timeout: 20 * time.Second},
+		BaseURL: strings.TrimRight(baseURL, "/"),
+		HTTP: &http.Client{
+			Timeout: 4 * time.Second,
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   800 * time.Millisecond,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				MaxIdleConns:        32,
+				MaxIdleConnsPerHost: 16,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 800 * time.Millisecond,
+			},
+		},
 		minInterval: 200 * time.Millisecond,
 	}
 }
@@ -60,14 +74,28 @@ func (c *HTTPClient) pace(ctx context.Context) error {
 }
 
 func (c *HTTPClient) get(ctx context.Context, path string, q url.Values, auth bool) ([]byte, error) {
+	return c.doGET(ctx, path, q, auth, true)
+}
+
+func (c *HTTPClient) getUrgent(ctx context.Context, path string, q url.Values, auth bool) ([]byte, error) {
+	return c.doGET(ctx, path, q, auth, false)
+}
+
+func (c *HTTPClient) doGET(ctx context.Context, path string, q url.Values, auth, paced bool) ([]byte, error) {
 	u := c.BaseURL + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
 	var lastErr error
-	for attempt := 0; attempt < 12; attempt++ {
-		if err := c.pace(ctx); err != nil {
-			return nil, err
+	attempts := 12
+	if !paced {
+		attempts = 2
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		if paced {
+			if err := c.pace(ctx); err != nil {
+				return nil, err
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
@@ -411,7 +439,9 @@ func (c *HTTPClient) GetNextNonce(accountIndex int64, apiKeyIndex uint8) (int64,
 	q := url.Values{}
 	q.Set("account_index", strconv.FormatInt(accountIndex, 10))
 	q.Set("api_key_index", strconv.Itoa(int(apiKeyIndex)))
-	b, err := c.get(context.Background(), "/api/v1/nextNonce", q, false)
+	nctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	b, err := c.getUrgent(nctx, "/api/v1/nextNonce", q, false)
 	if err != nil {
 		return 0, err
 	}
