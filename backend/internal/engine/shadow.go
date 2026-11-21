@@ -51,30 +51,31 @@ func (e *Engine) fillShadow(ctx context.Context, ts int64) error {
 	}
 	px1, err1 := e.BN.Close1s(ctx, "BTCUSDT", ts+1)
 	pxC, err2 := e.BN.Close5m(ctx, "BTCUSDT", ts)
+	var px, ret sql.NullFloat64
 	if err1 == nil && px1 > 0 {
-		w.ShadowBinancePxT1 = sql.NullFloat64{Float64: px1, Valid: true}
+		px = sql.NullFloat64{Float64: px1, Valid: true}
 	}
 	side := w.Side
-	if side == strategy.SideLong || side == strategy.SideShort {
-		if err1 == nil && px1 > 0 {
-			stopPx := strategy.StopPx(px1, side, e.Cfg.StopPricePct)
-			hit, _ := e.BN.StopHit1s(ctx, "BTCUSDT", ts+1, ts+300, side == strategy.SideLong, stopPx)
-			var ret float64
-			if hit && stopPx > 0 {
-				ret = strategy.Sign(side) * (stopPx/px1 - 1)
-			} else if err2 == nil && pxC > 0 {
-				ret = strategy.Sign(side) * (pxC/px1 - 1)
-			} else {
-				return e.Store.UpdateWindow(ctx, w)
-			}
-			w.ShadowRetBps = sql.NullFloat64{Float64: ret * 1e4, Valid: true}
+	if (side == strategy.SideLong || side == strategy.SideShort) && px.Valid {
+		stopPx := strategy.StopPx(px1, side, e.Cfg.StopPricePct)
+		hit, _ := e.BN.StopHit1s(ctx, "BTCUSDT", ts+1, ts+300, side == strategy.SideLong, stopPx)
+		var r float64
+		switch {
+		case hit && stopPx > 0:
+			r = strategy.Sign(side) * (stopPx/px1 - 1)
+			ret = sql.NullFloat64{Float64: r * 1e4, Valid: true}
+		case err2 == nil && pxC > 0:
+			r = strategy.Sign(side) * (pxC/px1 - 1)
+			ret = sql.NullFloat64{Float64: r * 1e4, Valid: true}
+		}
+		if ret.Valid {
 			var shadowEq float64
 			e.mutateGlobal(ctx, func(g *store.GlobalState) {
-				g.ShadowEquity *= (1 + ret*e.Cfg.Leverage*e.Cfg.EquityFraction)
+				g.ShadowEquity *= (1 + r*e.Cfg.Leverage*e.Cfg.EquityFraction)
 				shadowEq = g.ShadowEquity
 			})
 			_ = e.Store.InsertEquity(ctx, ts+300, "shadow", shadowEq)
 		}
 	}
-	return e.Store.UpdateWindow(ctx, w)
+	return e.Store.UpdateWindowShadow(ctx, ts, px, ret)
 }

@@ -44,6 +44,18 @@ type livePos struct {
 	SeenAcctOpen  bool
 	ExitClientIdx int64
 	ExitHash      string
+	// CloseMark is the last/mark used as the reduce IOC reference. It is not a fill.
+	CloseMark float64
+}
+
+// pendingClose is the one reduce already sent for a position. A second market
+// is allowed only after this one is known to have failed.
+type pendingClose struct {
+	WindowTS  int64
+	Side      string
+	ClientIdx int64
+	TxHash    string
+	Failed    bool
 }
 
 type Engine struct {
@@ -66,6 +78,7 @@ type Engine struct {
 	offsetAt    time.Time
 	clockRTT    time.Duration
 	pos         *livePos
+	pending     *pendingClose
 	lastQuote   strategy.Quote
 	lastSkip    string
 	lastWindow  int64
@@ -84,9 +97,10 @@ type Engine struct {
 	lastTimings *store.Timings
 
 	// Test seams (nil in production).
-	flatProbe   func(context.Context) (bool, lighter.Position, error)
-	pxProbe     func(context.Context) (float64, error)
-	skipWaitNext bool
+	flatProbe        func(context.Context) (bool, lighter.Position, error)
+	pxProbe          func(context.Context) (float64, error)
+	marketCloseProbe func(*livePos) (px, fee float64, err error)
+	skipWaitNext     bool
 }
 
 func New(cfg *config.Config, st *store.Store, httpClient *lighter.HTTPClient, signer *lighter.Signer, markets map[string]lighter.MarketMeta, pm *polymarket.Client, bn *binance.Client, n notify.Notifier, log *slog.Logger) *Engine {

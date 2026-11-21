@@ -290,10 +290,10 @@ Flatness **трёхзначная**: `flat` / `open` / `unknown` (сеть). О�
    - stop/remote + unknown без tape → market **без** CancelAll;
    - window/halt → CancelAll + market.
 4. `exit_late` + `bumpLateStreak` **только** если финальный poll = confirmed open. Unknown → alert `exit_flat_unknown`, streak не трогаем.
-5. PnL, `ExitReason`: `sl` | `closed_away` | `halt` | `window_close` | …
-6. `pos=nil`, shadow async, `waitNextOpen(next)` → `decide(next)`.
+5. PnL и `ExitReason`: `sl` | `closed_away` | `halt` | `window_close` | … Подтверждённый fill пишет цену и PnL. Без fill на границе цена и PnL остаются пустыми (`state=exit_pending`), ноль в статистику не попадает.
+6. `pos=nil`, shadow async (только shadow-колонки), `waitNextOpen(next)` → `decide(next)`.
 
-**Инвариант границы:** `window_close` не должен съедать T+2 следующего окна. На `nextSoon` — cancel+IOC без длинного ConfirmFill/tape wait; exit px/equity дожимает `refineExitAsync`. Arm next — до `exitAt` (не отрезать за 2s).
+**Инвариант границы:** `window_close` не должен съедать T+2 следующего окна. На `nextSoon` — один cancel+IOC без длинного ConfirmFill. Цена выхода не подменяется ценой входа. `refineExitAsync` дописывает fill отдельным UPDATE. Пока этот close in-flight и счёт не flat, новый вход и повторный reduce запрещены. Arm next — до `exitAt`.
 
 ---
 
@@ -311,6 +311,7 @@ p_up ≤ 1-th? ──да──► SHORT
 обе ≥ th? ──да──► both_ge_th + alert
 иначе ──────────────► below_th
 ready/equity/qty ok? ──нет──► ready / equity_too_small
+счёт не flat / close in-flight? ──да──► skip not_flat
 → send entry
 ```
 
@@ -472,7 +473,7 @@ main → Bootstrap → Run
 | README historically | one-liner без стопа | должен ссылаться на `_1_1` + этот файл |
 | Clock gate `_1` | skip если Binance offset &gt;1s | код: host UTC; Binance не блокирует вход (`_1_1`) |
 | Local stop watchdog | SLA &lt;200ms | exchange stop + `detectExit` + `resolveStopWatchdog` (poll flat → remote/residual/keep-stop); `exit_late` только на confirmed open |
-| window_close vs T+2 | flatten ≤300ms до :00 | sync path on boundary must not ConfirmFill 800ms / tape 1.5s; else next window `late` |
+| window_close vs T+2 | flatten ≤300ms до :00 | sync path on boundary must not ConfirmFill 800ms / tape 1.5s; exit px is not copied from entry; one in-flight reduce until the account is flat |
 | HALT 10 окон без стопа | в `_1_1` | заменено на immediate `stop_missing` |
 | Gamma synthetic book | CLOB канон | live gate: только WS/REST CLOB; Gamma mid не подставляет synthetic book |
 | Dry-run stop | risk model со стопом | paper path ставит `stop_loss` dry_run + `StopPx` в позиции |

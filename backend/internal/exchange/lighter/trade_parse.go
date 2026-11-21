@@ -2,85 +2,103 @@ package lighter
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
-// tradeRow is a typed Lighter trade payload with aliases for evolving field names.
-type tradeRow struct {
-	MarketID             int64   `json:"market_id"`
-	Price                float64 `json:"price"`
-	Size                 float64 `json:"size"`
-	USDAmount            float64 `json:"usd_amount"`
-	TakerFee             float64 `json:"taker_fee"`
-	Timestamp            int64   `json:"timestamp"`
-	TxHash               string  `json:"tx_hash"`
-	AskClientID          int64   `json:"ask_client_id"`
-	AskClientIDStr       string  `json:"ask_client_id_str"`
-	AskClientOrderIndex  int64   `json:"ask_client_order_index"`
-	AskClientOrderID     int64   `json:"ask_client_order_id"`
-	ClientOrderIndex     int64   `json:"client_order_index"`
-	BidClientID          int64   `json:"bid_client_id"`
-	BidClientIDStr       string  `json:"bid_client_id_str"`
-	BidClientOrderIndex  int64   `json:"bid_client_order_index"`
-	BidClientOrderID     int64   `json:"bid_client_order_id"`
-}
-
+// parseTradeRaw accepts Lighter trade payloads. Live trades encode price, size,
+// and client ids as strings; a typed float64/int64 struct drops the whole row.
 func parseTradeRaw(raw json.RawMessage) (Fill, bool) {
-	var row tradeRow
-	if err := json.Unmarshal(raw, &row); err != nil {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil || len(m) == 0 {
 		return Fill{}, false
 	}
-	mid, ok := asMarketID(int(row.MarketID))
+	mid, ok := asMarketID(int(int64Field(m, "market_id")))
 	if !ok {
 		return Fill{}, false
 	}
-	ask := firstNonZeroInt64(row.AskClientID, row.AskClientOrderIndex, row.AskClientOrderID, row.ClientOrderIndex)
-	if ask == 0 && row.AskClientIDStr != "" {
-		ask = parseInt64String(row.AskClientIDStr)
+	price := floatField(m, "price")
+	size := floatField(m, "size")
+	if price <= 0 || size <= 0 {
+		return Fill{}, false
 	}
-	bid := firstNonZeroInt64(row.BidClientID, row.BidClientOrderIndex, row.BidClientOrderID)
-	if bid == 0 && row.BidClientIDStr != "" {
-		bid = parseInt64String(row.BidClientIDStr)
-	}
-	m := map[string]any{
-		"taker_fee":  row.TakerFee,
-		"usd_amount": row.USDAmount,
-		"price":      row.Price,
-		"size":       row.Size,
-	}
+	ask := int64FieldNonZero(m,
+		"ask_client_id",
+		"ask_client_order_index",
+		"ask_client_order_id",
+		"client_order_index",
+		"ask_client_id_str",
+	)
+	bid := int64FieldNonZero(m,
+		"bid_client_id",
+		"bid_client_order_index",
+		"bid_client_order_id",
+		"bid_client_id_str",
+	)
 	return Fill{
 		MarketID:  mid,
-		Price:     row.Price,
-		Size:      row.Size,
-		USD:       row.USDAmount,
+		Price:     price,
+		Size:      size,
+		USD:       floatField(m, "usd_amount"),
 		Fee:       takerFeeUSD(m),
-		Timestamp: row.Timestamp,
-		TxHash:    row.TxHash,
+		Timestamp: int64Field(m, "timestamp"),
+		TxHash:    strField(m, "tx_hash"),
 		AskClient: ask,
 		BidClient: bid,
 	}, true
 }
 
-func firstNonZeroInt64(vals ...int64) int64 {
-	for _, v := range vals {
-		if v != 0 {
-			return v
+func int64Field(m map[string]any, key string) int64 {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return 0
+	}
+	n, ok := int64FromAny(v)
+	if !ok {
+		return 0
+	}
+	return n
+}
+
+func int64FieldNonZero(m map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		v, ok := m[key]
+		if !ok || v == nil {
+			continue
+		}
+		n, ok := int64FromAny(v)
+		if ok && n != 0 {
+			return n
 		}
 	}
 	return 0
 }
 
-func parseInt64String(s string) int64 {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
-	var n int64
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return 0
+func int64FromAny(v any) (int64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return int64(t), true
+	case string:
+		t = strings.TrimSpace(t)
+		if t == "" {
+			return 0, false
 		}
-		n = n*10 + int64(r-'0')
+		n, err := strconv.ParseInt(t, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	case json.Number:
+		n, err := t.Int64()
+		if err != nil {
+			f, ferr := t.Float64()
+			if ferr != nil {
+				return 0, false
+			}
+			return int64(f), true
+		}
+		return n, true
+	default:
+		return 0, false
 	}
-	return n
 }

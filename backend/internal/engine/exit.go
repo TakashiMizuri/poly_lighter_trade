@@ -58,6 +58,10 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 	if plan.CancelAll && e.Signer != nil {
 		if err := e.Signer.CancelAll(ctx); err != nil {
 			e.Log.Warn("cancel orders during settle", "err", err, "reason", reason, "mode", plan.Mode)
+		} else if e.Store != nil {
+			if err := e.Store.CancelOpenStops(ctx, pos.WindowTS); err != nil {
+				e.Log.Warn("mark stops canceled", "err", err, "window_ts", pos.WindowTS)
+			}
 		}
 	}
 	if plan.MarketClose {
@@ -88,7 +92,11 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 					flat = cur
 					break
 				}
-				// Only hammer market closes when still open or flatness unknown.
+				// One reduce at a time. A live close is not a reason to send another.
+				if e.closeInFlight() {
+					time.Sleep(150 * time.Millisecond)
+					continue
+				}
 				if !cur.Known || !cur.Flat {
 					cpx, cfee, _ := e.sendMarketClose(ctx, pos, 0)
 					if cpx > 0 {
@@ -123,10 +131,8 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 			px = mark
 		}
 	}
-	if px <= 0 {
-		// Provisional: entry is better than 0 for ready-state; refineExitAsync fixes PnL.
-		px = pos.EntryPx
-	}
+	// A missing tape fill is not the entry. Leave price and PnL empty until refineExitAsync.
+	exitConfirmed := px > 0
 	eq := pos.EquityBefore
 	if !nextSoon {
 		if v, err := e.equity(ctx); err == nil && v > 0 {
@@ -141,28 +147,43 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 			eq = v
 		}
 	}
-	e.markReadyAfterClose(px, eq)
-	sign := strategy.Sign(pos.Side)
-	ret := 0.0
-	if pos.EntryPx > 0 && px > 0 {
-		ret = sign * (px/pos.EntryPx - 1)
+	readyPx := 0.0
+	if pos.CloseMark > 0 && (pos.EntryPx <= 0 || math.Abs(pos.CloseMark-pos.EntryPx) >= 1e-6) {
+		readyPx = pos.CloseMark
 	}
-	pnl := pos.Notional * ret
+	if readyPx <= 0 && exitConfirmed {
+		readyPx = px
+	}
+	e.markReadyAfterClose(readyPx, eq, exitConfirmed)
+	ret := 0.0
+	pnl := 0.0
 	fees := pos.Fees + fee
+	if exitConfirmed && pos.EntryPx > 0 {
+		ret = strategy.Sign(pos.Side) * (px/pos.EntryPx - 1)
+		pnl = pos.Notional*ret - fees
+	}
 	w, err := e.Store.GetWindow(ctx, pos.WindowTS)
 	if err != nil {
 		w = store.Window{WindowTS: pos.WindowTS, Side: pos.Side}
 	}
-	w.LighterExitTS = sql.NullFloat64{Float64: e.unix(), Valid: true}
-	w.LighterExitPx = sql.NullFloat64{Float64: px, Valid: true}
 	w.EquityAfter = sql.NullFloat64{Float64: eq, Valid: true}
-	w.PnLUSD = sql.NullFloat64{Float64: pnl - fees, Valid: true}
-	w.RetBps = sql.NullFloat64{Float64: ret * 1e4, Valid: true}
 	w.FeesUSD = sql.NullFloat64{Float64: fees, Valid: true}
-	w.State = "closed"
+	if exitConfirmed {
+		w.LighterExitTS = sql.NullFloat64{Float64: e.unix(), Valid: true}
+		w.LighterExitPx = sql.NullFloat64{Float64: px, Valid: true}
+		w.PnLUSD = sql.NullFloat64{Float64: pnl, Valid: true}
+		w.RetBps = sql.NullFloat64{Float64: ret * 1e4, Valid: true}
+		w.State = "closed"
+	} else {
+		w.LighterExitTS = sql.NullFloat64{}
+		w.LighterExitPx = sql.NullFloat64{}
+		w.PnLUSD = sql.NullFloat64{}
+		w.RetBps = sql.NullFloat64{}
+		w.State = "exit_pending"
+	}
 	if reason == "stop" {
 		w.ExitReason = "sl"
-		if pos.StopPx > 0 {
+		if pos.StopPx > 0 && px > 0 {
 			w.StopPx = sql.NullFloat64{Float64: pos.StopPx, Valid: true}
 			w.SLSlipBps = sql.NullFloat64{Float64: strategy.SLSlipBps(pos.EntryPx, px, pos.Side, e.Cfg.StopPricePct), Valid: true}
 		}
@@ -199,7 +220,11 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 	e.mu.Unlock()
 	e.setState(StateIdle)
 	e.flogWindow("exit", w)
-	e.alert(ctx, "info", "exit", fmt.Sprintf("%s pnl=%.2f ret=%.2fbps eq=%.2f", pos.Side, pnl-fees, ret*1e4, eq))
+	if exitConfirmed {
+		e.alert(ctx, "info", "exit", fmt.Sprintf("%s pnl=%.2f ret=%.2fbps eq=%.2f", pos.Side, pnl, ret*1e4, eq))
+	} else {
+		e.alert(ctx, "warn", "exit", fmt.Sprintf("%s exit pending tape eq=%.2f", pos.Side, eq))
+	}
 	if pos.ExitClientIdx != 0 {
 		e.refineExitAsync(pos, pos.ExitClientIdx, pos.ExitHash)
 	}
@@ -304,8 +329,14 @@ func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64
 }
 
 func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait time.Duration) (px, fee float64, err error) {
+	if e.marketCloseProbe != nil {
+		return e.marketCloseProbe(pos)
+	}
 	if e.Cfg.DryRun || e.Signer == nil {
 		px, err = e.btcPx(ctx)
+		if err == nil && px > 0 && pos != nil {
+			pos.CloseMark = px
+		}
 		return px, 0, err
 	}
 	var ref float64
@@ -326,6 +357,9 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 			return 0, 0, err
 		}
 	}
+	if pos != nil {
+		pos.CloseMark = ref
+	}
 	buy := pos.Side == strategy.SideShort // closing short = buy
 	idx := e.nextClientIdx(ctx)
 	res, err := e.Signer.MarketIOC(ctx, e.Cfg.Symbol, buy, pos.Qty, ref, e.Cfg.MarketSlippage, idx, true)
@@ -333,6 +367,7 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 	_ = e.Store.InsertOrder(ctx, pos.WindowTS, "exit", errString(err, "sent"), idx, txHash, pos.Qty, ref, nil)
 	if err != nil {
 		if !lighter.IsAmbiguousSubmit(err) {
+			e.failPendingClose(pos, idx, txHash)
 			return 0, 0, err
 		}
 		e.Log.Warn("exit send ambiguous; reconciling", "err", err, "client_idx", idx)
@@ -340,6 +375,7 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 	}
 	pos.ExitClientIdx = idx
 	pos.ExitHash = txHash
+	e.notePendingClose(pos, idx, txHash)
 	meta := e.Markets[e.Cfg.Symbol]
 	// fillWait<=0 means boundary/urgent close: at most one trades poll. Burning
 	// 800ms here is what pushes decide(next) past T+2 after window_close.
@@ -363,13 +399,17 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 	})
 	cancel()
 	if fill.Qty > 0 && fill.Px > 0 {
-		// Keep ExitClientIdx/Hash so refineExitAsync can still correct a bad VWAP.
+		e.clearPendingClose()
+		if e.Store != nil {
+			_ = e.Store.UpdateOrderFill(ctx, idx, "filled", fill.Px)
+		}
 		return fill.Px, fill.Fee, nil
 	}
 	// Close may already be done on the venue, but ref/FallbackPx is NOT a fill.
 	// Returning 0 forces ensureExitPx / refineExitAsync to book from trades tape.
 	if !boundaryFast {
 		if flat, _, ferr := e.isFlat(ctx); ferr == nil && flat {
+			e.clearPendingClose()
 			e.Log.Warn("exit fill unconfirmed while flat; deferring px to tape", "client_idx", idx, "ref", ref)
 			return 0, 0, nil
 		}
@@ -399,30 +439,161 @@ func (e *Engine) refineExitAsync(pos *livePos, clientIdx int64, txHash string) {
 			e.Log.Warn("refine exit: fill still missing", "client_idx", clientIdx, "window_ts", windowTS)
 			return
 		}
-		w, err := e.Store.GetWindow(ctx, windowTS)
-		if err != nil {
+		if err := e.bookExitFill(ctx, store.UnconfirmedExit{
+			WindowTS: windowTS, Side: side, EntryPx: entry, Notional: notional, Fees: entryFees, ClientIdx: clientIdx,
+		}, px, fee); err != nil {
+			e.Log.Warn("refine exit book", "err", err, "window_ts", windowTS, "client_idx", clientIdx)
 			return
 		}
-		// Only overwrite when we improve on a missing/suspicious book (entry-as-exit).
-		if w.LighterExitPx.Valid && w.LighterExitPx.Float64 > 0 && entry > 0 &&
-			math.Abs(w.LighterExitPx.Float64-entry) >= 1e-6 &&
-			math.Abs(w.LighterExitPx.Float64-px) < 1e-6 {
-			return
-		}
-		w.LighterExitPx = sql.NullFloat64{Float64: px, Valid: true}
-		fees := entryFees + fee
-		if w.FeesUSD.Valid && w.FeesUSD.Float64 > fees {
-			fees = w.FeesUSD.Float64
-		}
-		w.FeesUSD = sql.NullFloat64{Float64: fees, Valid: true}
-		if entry > 0 {
-			ret := strategy.Sign(side) * (px/entry - 1)
-			w.RetBps = sql.NullFloat64{Float64: ret * 1e4, Valid: true}
-			w.PnLUSD = sql.NullFloat64{Float64: notional*ret - fees, Valid: true}
-		}
-		_ = e.Store.UpdateWindow(ctx, w)
 		e.Log.Info("refine exit booked", "window_ts", windowTS, "px", px, "client_idx", clientIdx)
 	}()
+}
+
+func (e *Engine) bookExitFill(ctx context.Context, row store.UnconfirmedExit, px, fee float64) error {
+	if e.Store == nil || row.WindowTS == 0 || px <= 0 {
+		return nil
+	}
+	w, err := e.Store.GetWindow(ctx, row.WindowTS)
+	if err != nil {
+		return err
+	}
+	entry := row.EntryPx
+	if entry <= 0 && w.LighterEntryPx.Valid {
+		entry = w.LighterEntryPx.Float64
+	}
+	if w.LighterExitPx.Valid && w.LighterExitPx.Float64 > 0 && entry > 0 &&
+		math.Abs(w.LighterExitPx.Float64-entry) >= 1e-6 {
+		if math.Abs(w.LighterExitPx.Float64-px) < 1e-6 && row.ClientIdx != 0 {
+			_ = e.Store.UpdateOrderFill(ctx, row.ClientIdx, "filled", px)
+		}
+		return nil
+	}
+	fees := row.Fees + fee
+	if w.FeesUSD.Valid && w.FeesUSD.Float64 > fees {
+		fees = w.FeesUSD.Float64
+	}
+	notional := row.Notional
+	if notional <= 0 && w.Notional.Valid {
+		notional = w.Notional.Float64
+	}
+	ret := 0.0
+	pnl := -fees
+	if entry > 0 {
+		ret = strategy.Sign(row.Side) * (px/entry - 1)
+		pnl = notional*ret - fees
+	}
+	reason := w.ExitReason
+	if reason == "" {
+		reason = "window_close"
+	}
+	if err := e.Store.UpdateWindowExit(ctx, row.WindowTS, e.unix(), px, pnl, ret*1e4, fees, "closed", reason); err != nil {
+		return err
+	}
+	if row.ClientIdx != 0 {
+		if err := e.Store.UpdateOrderFill(ctx, row.ClientIdx, "filled", px); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Engine) repairUnconfirmedExits(ctx context.Context) {
+	if e.HTTP == nil || e.Store == nil || e.Cfg == nil {
+		return
+	}
+	since := e.now().Add(-24 * time.Hour).Unix()
+	rows, err := e.Store.ListUnconfirmedExits(ctx, since)
+	if err != nil {
+		e.Log.Warn("repair exits", "err", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	meta, ok := e.Markets[e.Cfg.Symbol]
+	if !ok {
+		e.Log.Warn("repair exits: market missing", "symbol", e.Cfg.Symbol)
+		return
+	}
+	fills, err := e.HTTP.AccountTrades(ctx, e.Cfg.AccountIndex, meta.MarketID, 100)
+	if err != nil {
+		e.Log.Warn("repair exits: trades", "err", err, "n", len(rows))
+		return
+	}
+	for _, row := range rows {
+		px, qty, fee, _ := lighter.VWAP(lighter.FillsMatching(fills, row.ClientIdx, row.TxHash))
+		if qty <= 0 || px <= 0 {
+			continue
+		}
+		if err := e.bookExitFill(ctx, row, px, fee); err != nil {
+			e.Log.Warn("repair exit", "err", err, "window_ts", row.WindowTS)
+			continue
+		}
+		e.Log.Info("repaired exit from tape", "window_ts", row.WindowTS, "px", px, "client_idx", row.ClientIdx)
+	}
+}
+
+func (e *Engine) closeInFlight() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.pending != nil && !e.pending.Failed && e.pending.ClientIdx != 0
+}
+
+func (e *Engine) notePendingClose(pos *livePos, idx int64, hash string) {
+	if pos == nil || idx == 0 {
+		return
+	}
+	e.mu.Lock()
+	e.pending = &pendingClose{WindowTS: pos.WindowTS, Side: pos.Side, ClientIdx: idx, TxHash: hash}
+	e.mu.Unlock()
+}
+
+func (e *Engine) failPendingClose(pos *livePos, idx int64, hash string) {
+	e.mu.Lock()
+	e.pending = &pendingClose{WindowTS: pos.WindowTS, Side: pos.Side, ClientIdx: idx, TxHash: hash, Failed: true}
+	e.mu.Unlock()
+}
+
+func (e *Engine) clearPendingClose() {
+	e.mu.Lock()
+	e.pending = nil
+	e.mu.Unlock()
+}
+
+// confirmFlatForEntry blocks a new entry while the previous reduce is still
+// working or the account is not flat. It does not send another order.
+func (e *Engine) confirmFlatForEntry(ctx context.Context, deadline time.Time) error {
+	if e.Cfg.DryRun || (e.HTTP == nil && e.flatProbe == nil) {
+		return nil
+	}
+	budgetEnd := deadline.Add(-50 * time.Millisecond)
+	for {
+		flat, _, err := e.isFlat(ctx)
+		if err == nil && flat {
+			e.clearPendingClose()
+			e.mu.Lock()
+			e.readyOK = e.readyEq > 0 && e.readyPx > 0
+			e.mu.Unlock()
+			return nil
+		}
+		if err == nil && !flat {
+			if e.closeInFlight() {
+				return fmt.Errorf("previous close still open")
+			}
+			return fmt.Errorf("account not flat")
+		}
+		if !time.Now().Before(budgetEnd) {
+			if err != nil {
+				return fmt.Errorf("flatness unknown: %w", err)
+			}
+			return fmt.Errorf("account not flat")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(80 * time.Millisecond):
+		}
+	}
 }
 
 func (e *Engine) ensureFlat(ctx context.Context, why string) error {
@@ -433,8 +604,17 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 		if live != nil {
 			return nil
 		}
+		if e.closeInFlight() {
+			flat, _, err := e.isFlat(ctx)
+			if err == nil && flat {
+				e.clearPendingClose()
+				return nil
+			}
+			e.Log.Warn("flatten deferred; close in flight", "why", why, "err", err)
+			return nil
+		}
 	}
-	if e.Cfg.DryRun || e.Signer == nil {
+	if e.Cfg.DryRun || (e.Signer == nil && e.marketCloseProbe == nil) {
 		e.mu.Lock()
 		e.pos = nil
 		e.mu.Unlock()
@@ -461,9 +641,11 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 		if live.Qty <= 0 {
 			break
 		}
-		_, _, err := e.sendMarketClose(ctx, live, 0)
-		if err != nil {
-			e.Log.Warn("flatten retry", "err", err)
+		if !e.closeInFlight() {
+			_, _, err := e.sendMarketClose(ctx, live, 0)
+			if err != nil {
+				e.Log.Warn("flatten retry", "err", err)
+			}
 		}
 		time.Sleep(200 * time.Millisecond)
 		flat, cur, ferr := e.isFlat(ctx)
@@ -471,8 +653,11 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 			continue
 		}
 		if flat {
-			if err := e.Signer.CancelAll(ctx); err != nil {
-				e.Log.Warn("cancel residual orders after flatten", "why", why, "err", err)
+			e.clearPendingClose()
+			if e.Signer != nil {
+				if err := e.Signer.CancelAll(ctx); err != nil {
+					e.Log.Warn("cancel residual orders after flatten", "why", why, "err", err)
+				}
 			}
 			return nil
 		}

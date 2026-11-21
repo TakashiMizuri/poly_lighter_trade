@@ -34,6 +34,7 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 		e.Log.Error("boot flatten", "err", err)
 		e.halt(ctx, "boot_flatten")
 	}
+	e.repairUnconfirmedExits(ctx)
 	eq, _ := e.equity(ctx)
 	if eq > 0 && g.StartEquity == 0 {
 		g.StartEquity = eq
@@ -255,7 +256,7 @@ func (e *Engine) refreshReady(ctx context.Context) error {
 	return nil
 }
 
-func (e *Engine) markReadyAfterClose(px, eq float64) {
+func (e *Engine) markReadyAfterClose(px, eq float64, flat bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if eq > 0 {
@@ -263,11 +264,9 @@ func (e *Engine) markReadyAfterClose(px, eq float64) {
 	}
 	if px > 0 {
 		e.readyPx = px
-	}
-	if e.readyEq > 0 && e.readyPx > 0 {
 		e.readyAt = time.Now()
-		e.readyOK = true
 	}
+	e.readyOK = flat && e.readyEq > 0 && e.readyPx > 0 && !e.readyAt.IsZero() && time.Since(e.readyAt) <= 5*time.Second
 }
 
 func (e *Engine) sleepToExit(ctx context.Context, ts int64) error {

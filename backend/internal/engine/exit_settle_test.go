@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -243,5 +244,165 @@ func TestResolveStopWatchdogGrace(t *testing.T) {
 	}
 	if _, _, _, ok := e.resolveStopWatchdog(context.Background(), pos); ok {
 		t.Fatal("watchdog must respect post-entry grace")
+	}
+}
+
+func TestFinalizeBoundaryDoesNotCopyEntry(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC().Unix()
+	ts := now - (now % 300) - 300
+	ctx := context.Background()
+	_ = st.InsertWindow(ctx, store.Window{WindowTS: ts, Side: strategy.SideLong, State: StateInPosition})
+
+	cfg := testConfig()
+	e := New(cfg, st, nil, nil, nil, nil, nil, nil, nil)
+	e.skipWaitNext = true
+	e.readyPx = 60100
+	e.readyEq = 25
+	e.readyAt = time.Now().Add(-time.Minute)
+	e.pxProbe = func(context.Context) (float64, error) {
+		return 0, errors.New("no mark")
+	}
+
+	pos := &livePos{
+		WindowTS: ts, Side: strategy.SideLong, Qty: 0.00041, Notional: 24.642845,
+		EntryPx: 60104.5, EntryTS: float64(ts + 1), EquityBefore: 25.037493,
+		ArmedAt: time.Now().Add(-time.Minute), SeenAcctOpen: true,
+	}
+	if err := e.finalizePosition(ctx, pos, "", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	w, err := st.GetWindow(ctx, ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.LighterExitPx.Valid || w.PnLUSD.Valid || w.RetBps.Valid {
+		t.Fatalf("unconfirmed exit must stay empty: exit=%+v pnl=%+v ret=%+v", w.LighterExitPx, w.PnLUSD, w.RetBps)
+	}
+	if w.State != "exit_pending" || w.ExitReason != "window_close" {
+		t.Fatalf("state=%q reason=%q", w.State, w.ExitReason)
+	}
+	if e.readyPx != 60100 {
+		t.Fatalf("ready px %v must not become the entry", e.readyPx)
+	}
+	if e.readyOK {
+		t.Fatal("readyOK must stay false until the close is confirmed")
+	}
+}
+
+func TestEnsureFlatDoesNotSendWhileCloseInFlight(t *testing.T) {
+	cfg := testConfig()
+	cfg.DryRun = false
+	e := New(cfg, nil, nil, nil, nil, nil, nil, nil, nil)
+	e.pending = &pendingClose{WindowTS: 1, ClientIdx: 287000012, Side: strategy.SideShort}
+	e.flatProbe = func(context.Context) (bool, lighter.Position, error) {
+		return false, lighter.Position{Size: 0.00041, Sign: -1}, nil
+	}
+	called := 0
+	e.marketCloseProbe = func(*livePos) (float64, float64, error) {
+		called++
+		return 0, 0, nil
+	}
+	if err := e.ensureFlat(context.Background(), "skip"); err != nil {
+		t.Fatal(err)
+	}
+	if called != 0 {
+		t.Fatalf("market closes=%d", called)
+	}
+	if !e.closeInFlight() {
+		t.Fatal("in-flight close was cleared")
+	}
+}
+
+func TestConfirmFlatRejectsInFlightClose(t *testing.T) {
+	cfg := testConfig()
+	cfg.DryRun = false
+	e := New(cfg, nil, nil, nil, nil, nil, nil, nil, nil)
+	e.readyEq = 25
+	e.readyPx = 60131.1
+	e.readyAt = time.Now()
+	e.pending = &pendingClose{WindowTS: 1, ClientIdx: 287000012, Side: strategy.SideShort}
+	e.flatProbe = func(context.Context) (bool, lighter.Position, error) {
+		return false, lighter.Position{Size: 0.00041, Sign: -1}, nil
+	}
+	err := e.confirmFlatForEntry(context.Background(), time.Now().Add(time.Second))
+	if err == nil {
+		t.Fatal("expected not flat")
+	}
+	e.flatProbe = func(context.Context) (bool, lighter.Position, error) {
+		return true, lighter.Position{}, nil
+	}
+	if err := e.confirmFlatForEntry(context.Background(), time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if e.closeInFlight() {
+		t.Fatal("flat account must clear the in-flight close")
+	}
+	if !e.readyOK {
+		t.Fatal("readyOK")
+	}
+}
+
+func TestBookExitFillSurvivesShadow(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ts := int64(1795287000)
+	w := store.Window{WindowTS: ts, Side: strategy.SideLong, ExitReason: "window_close", State: "closed"}
+	w.LighterEntryPx.Float64, w.LighterEntryPx.Valid = 60104.5, true
+	w.LighterExitPx.Float64, w.LighterExitPx.Valid = 60104.5, true
+	w.PnLUSD.Float64, w.PnLUSD.Valid = 0, true
+	w.Notional.Float64, w.Notional.Valid = 24.642845, true
+	if err := st.InsertWindow(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertOrder(ctx, ts, "exit", "sent", 287000009, "f40b4fed", 0.00041, 60079.2, nil); err != nil {
+		t.Fatal(err)
+	}
+	e := New(testConfig(), st, nil, nil, nil, nil, nil, nil, nil)
+	rows, err := st.ListUnconfirmedExits(ctx, ts)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows=%v err=%v", rows, err)
+	}
+	if err := e.bookExitFill(ctx, rows[0], 60078, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateWindowShadow(ctx, ts,
+		sql.NullFloat64{Float64: 60133.3, Valid: true},
+		sql.NullFloat64{Float64: -2.82, Valid: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetWindow(ctx, ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.LighterExitPx.Valid || got.LighterExitPx.Float64 != 60078 {
+		t.Fatalf("exit %+v", got.LighterExitPx)
+	}
+	if !got.PnLUSD.Valid || got.PnLUSD.Float64 >= 0 {
+		t.Fatalf("pnl %+v", got.PnLUSD)
+	}
+	if got.State != "closed" {
+		t.Fatalf("state %q", got.State)
+	}
+	if !got.ShadowBinancePxT1.Valid || got.ShadowBinancePxT1.Float64 != 60133.3 {
+		t.Fatalf("shadow %+v", got.ShadowBinancePxT1)
+	}
+	orders, err := st.ListOrders(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0]["status"] != "filled" {
+		t.Fatalf("orders %+v", orders)
 	}
 }

@@ -175,8 +175,13 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	e.mu.Lock()
 	readyOK, readyAt := e.readyOK, e.readyAt
 	e.mu.Unlock()
-	if !readyOK || eq <= 0 || px <= 0 || time.Since(readyAt) > 5*time.Second {
+	if eq <= 0 || px <= 0 || readyAt.IsZero() || time.Since(readyAt) > 5*time.Second {
 		return e.finishSkip(ctx, w, "ready", "equity/price/flat state is not fresh from prewarm")
+	}
+	if !readyOK || e.closeInFlight() {
+		if err := e.confirmFlatForEntry(ctx, deadline); err != nil {
+			return e.finishSkip(ctx, w, "not_flat", err.Error())
+		}
 	}
 	meta := e.Markets[e.Cfg.Symbol]
 	qty := strategy.FloorLot((eq*e.Cfg.EquityFraction*e.Cfg.Leverage)/px, meta.SizeDecimals)
@@ -294,6 +299,9 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		e.saveWindow(ctx, w)
 		e.flogWindow("skip", w)
 		return e.sleepToExit(ctx, ts)
+	}
+	if e.Store != nil {
+		_ = e.Store.UpdateOrderFill(ctx, clientIdx, "filled", fillPx)
 	}
 	e.bumpLateStreak(ctx, false)
 	usedQty := fillQty

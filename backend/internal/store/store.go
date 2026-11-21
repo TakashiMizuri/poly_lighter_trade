@@ -378,6 +378,104 @@ FROM orders ORDER BY id DESC LIMIT ?`, limit)
 	return out, rows.Err()
 }
 
+// UpdateOrderFill records a confirmed venue fill against the client order index.
+func (s *Store) UpdateOrderFill(ctx context.Context, clientIdx int64, status string, px float64) error {
+	if s == nil || clientIdx == 0 {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx, `
+UPDATE orders SET status=?, price=? WHERE client_order_index=?`, status, px, clientIdx)
+	return err
+}
+
+// CancelOpenStops marks resting stop orders canceled after a successful CancelAll.
+func (s *Store) CancelOpenStops(ctx context.Context, windowTS int64) error {
+	if s == nil {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx, `
+UPDATE orders SET status='canceled'
+WHERE window_ts=? AND kind='stop_loss' AND status='sent'`, windowTS)
+	return err
+}
+
+// UpdateWindowExit writes only the confirmed close. Shadow columns stay untouched.
+func (s *Store) UpdateWindowExit(ctx context.Context, windowTS int64, exitTS, exitPx, pnl, retBps, fees float64, state, exitReason string) error {
+	if s == nil {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx, `
+UPDATE windows SET
+  lighter_exit_ts=?, lighter_exit_px=?, pnl_usd=?, ret_bps=?, fees_usd=?,
+  state=?, exit_reason=?
+WHERE window_ts=?`,
+		exitTS, exitPx, pnl, retBps, fees, state, exitReason, windowTS)
+	return err
+}
+
+// UpdateWindowShadow writes only the Binance shadow columns.
+func (s *Store) UpdateWindowShadow(ctx context.Context, windowTS int64, px, ret sql.NullFloat64) error {
+	if s == nil {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx, `
+UPDATE windows SET
+  shadow_binance_px_t1=COALESCE(?, shadow_binance_px_t1),
+  shadow_ret_bps=COALESCE(?, shadow_ret_bps)
+WHERE window_ts=?`,
+		nullF(px.Float64, px.Valid), nullF(ret.Float64, ret.Valid), windowTS)
+	return err
+}
+
+// UnconfirmedExit is a window_close whose booked exit is missing or copied from the entry.
+type UnconfirmedExit struct {
+	WindowTS  int64
+	Side      string
+	EntryPx   float64
+	Notional  float64
+	Fees      float64
+	ClientIdx int64
+	TxHash    string
+}
+
+// ListUnconfirmedExits returns recent window closes that still need a tape price.
+// One row per window: the earliest exit order.
+func (s *Store) ListUnconfirmedExits(ctx context.Context, since int64) ([]UnconfirmedExit, error) {
+	if s == nil {
+		return nil, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT w.window_ts, w.side, IFNULL(w.lighter_entry_px,0), IFNULL(w.notional,0), IFNULL(w.fees_usd,0),
+       o.client_order_index, IFNULL(o.tx_hash,'')
+FROM windows w
+JOIN orders o ON o.id = (
+  SELECT MIN(id) FROM orders
+  WHERE window_ts = w.window_ts AND kind = 'exit' AND IFNULL(client_order_index,0) != 0
+)
+WHERE w.window_ts >= ?
+  AND w.exit_reason = 'window_close'
+  AND w.side IN ('long','short')
+  AND w.lighter_entry_px IS NOT NULL
+  AND (
+    w.lighter_exit_px IS NULL
+    OR w.pnl_usd IS NULL
+    OR ABS(w.lighter_exit_px - w.lighter_entry_px) < 1e-6
+  )`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UnconfirmedExit
+	for rows.Next() {
+		var row UnconfirmedExit
+		if err := rows.Scan(&row.WindowTS, &row.Side, &row.EntryPx, &row.Notional, &row.Fees, &row.ClientIdx, &row.TxHash); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) InsertEvent(ctx context.Context, level, kind, message string, payload any) error {
 	var raw string
 	if payload != nil {
@@ -590,17 +688,20 @@ WHERE quote_source != '' AND quote_ts IS NOT NULL
 	if st.NWindows > 0 {
 		st.Coverage = float64(st.NQuoted) / float64(st.NWindows)
 	}
-	var wins int
+	var wins, settled int
 	_ = s.DB.QueryRowContext(ctx, `
 SELECT COUNT(1) FROM windows
 WHERE side IN ('long','short') AND lighter_entry_px IS NOT NULL AND pnl_usd IS NOT NULL AND pnl_usd > 0`).Scan(&wins)
+	_ = s.DB.QueryRowContext(ctx, `
+SELECT COUNT(1) FROM windows
+WHERE side IN ('long','short') AND lighter_entry_px IS NOT NULL AND pnl_usd IS NOT NULL`).Scan(&settled)
 	var meanBps, meanPnL sql.NullFloat64
 	_ = s.DB.QueryRowContext(ctx, `
 SELECT AVG(ret_bps), AVG(pnl_usd) FROM windows
 WHERE side IN ('long','short') AND lighter_entry_px IS NOT NULL
   AND ret_bps IS NOT NULL AND pnl_usd IS NOT NULL`).Scan(&meanBps, &meanPnL)
-	if st.NTrades > 0 {
-		st.WR = float64(wins) / float64(st.NTrades)
+	if settled > 0 {
+		st.WR = float64(wins) / float64(settled)
 	}
 	if meanBps.Valid {
 		st.MeanBps = meanBps.Float64
@@ -652,6 +753,7 @@ SELECT equity_after FROM windows WHERE equity_after IS NOT NULL ORDER BY window_
 		toTS = sampleTo.Int64
 	}
 	st.Forecast = BuildForecast(equity, st.NTrades, st.NWindows, wins, st.MeanBps, st.MeanPnLUSD, fromTS, toTS)
+	st.Forecast.WR = st.WR
 	return st, nil
 }
 

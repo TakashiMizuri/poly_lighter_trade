@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
@@ -148,5 +149,88 @@ func TestLiveShadowGap(t *testing.T) {
 	_, coef = LiveShadowGap(1.0, 0)
 	if coef != nil {
 		t.Fatal("expected nil coef when shadow ~0")
+	}
+}
+
+func TestShadowUpdateLeavesExit(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	w := Window{WindowTS: 3000, Side: "long", ExitReason: "window_close", State: "closed"}
+	w.LighterEntryPx.Float64, w.LighterEntryPx.Valid = 60104.5, true
+	w.LighterExitPx.Float64, w.LighterExitPx.Valid = 60078, true
+	w.PnLUSD.Float64, w.PnLUSD.Valid = -0.011, true
+	if err := st.InsertWindow(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateWindowShadow(ctx, 3000,
+		sql.NullFloat64{Float64: 60133.3, Valid: true},
+		sql.NullFloat64{Float64: -2.8, Valid: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetWindow(ctx, 3000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.LighterExitPx.Valid || got.LighterExitPx.Float64 != 60078 {
+		t.Fatalf("exit %+v", got.LighterExitPx)
+	}
+	if !got.PnLUSD.Valid || got.PnLUSD.Float64 != -0.011 {
+		t.Fatalf("pnl %+v", got.PnLUSD)
+	}
+	if !got.ShadowBinancePxT1.Valid || got.ShadowBinancePxT1.Float64 != 60133.3 {
+		t.Fatalf("shadow %+v", got.ShadowBinancePxT1)
+	}
+	if !got.ShadowRetBps.Valid || got.ShadowRetBps.Float64 != -2.8 {
+		t.Fatalf("shadow ret %+v", got.ShadowRetBps)
+	}
+}
+
+func TestListUnconfirmedCopiedExit(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	w := Window{WindowTS: 4000, Side: "short", ExitReason: "window_close", State: "closed"}
+	w.LighterEntryPx.Float64, w.LighterEntryPx.Valid = 60077.4, true
+	w.LighterExitPx.Float64, w.LighterExitPx.Valid = 60077.4, true
+	w.PnLUSD.Float64, w.PnLUSD.Valid = 0, true
+	w.Notional.Float64, w.Notional.Valid = 24.63, true
+	if err := st.InsertWindow(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertOrder(ctx, 4000, "exit", "sent", 287000012, "e2b02e75", 0.00041, 60131.1, nil); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.ListUnconfirmedExits(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ClientIdx != 287000012 || rows[0].EntryPx != 60077.4 {
+		t.Fatalf("%+v", rows)
+	}
+	if err := st.UpdateWindowExit(ctx, 4000, 1, 60141.4, -0.026, -10.6, 0, "closed", "window_close"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = st.ListUnconfirmedExits(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("still unconfirmed %+v", rows)
+	}
+	got, err := st.GetWindow(ctx, 4000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LighterExitPx.Float64 != 60141.4 || got.State != "closed" {
+		t.Fatalf("%+v", got)
 	}
 }

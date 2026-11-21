@@ -3,7 +3,7 @@
 Краткая навигация для ИИ и людей. Детали стратегии — в `docs/`, деплой — в `INSTRUCTIONS.md`.  
 **Обновляй эту карту**, когда меняется структура, ответственность пакетов или критичные потоки.
 
-Последняя актуализация: 2026-11-22 (dashboard equity forecast week/month/year).
+Последняя актуализация: 2026-11-22 (exit fill только с ленты; один in-flight close).
 
 ---
 
@@ -74,11 +74,12 @@ main.go
        → if submit ack lost (timeout/reset): reconcile, do not assume reject
        → confirm fill + optional stop-loss
        → hold → exit / detect remote close / flatten
-       → settle window + shadow binance
+       → settle: one reduce; exit px/PnL only from the tape (refine if the boundary cannot wait)
+       → shadow binance (shadow columns only)
   ↔ api.Server (dashboard, kill/resume, status)
 ```
 
-**Жёсткие места риска:** ambiguous `sendTx` (см. `lighter.IsAmbiguousSubmit` → reconcile через `confirmLiveFill`); flatten/prewarm; stop_missing; entry_unconfirmed; общий VPS clock с Donchian.
+**Жёсткие места риска:** ambiguous `sendTx` (см. `lighter.IsAmbiguousSubmit` → reconcile через `confirmLiveFill`); выход на границе не считается fill, пока лента не подтвердила цену; один in-flight reduce, пока счёт не flat; flatten/prewarm; stop_missing; entry_unconfirmed; общий VPS clock с Donchian.
 
 ---
 
