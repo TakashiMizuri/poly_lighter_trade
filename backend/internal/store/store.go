@@ -562,6 +562,7 @@ type Stats struct {
 	Coverage      float64  `json:"coverage"`
 	WR            float64  `json:"wr"`
 	MeanBps       float64  `json:"mean_bps"`
+	MeanPnLUSD    float64  `json:"mean_pnl_usd"`
 	ShadowMeanBps float64  `json:"shadow_mean_bps"`
 	GapBps        float64  `json:"gap_bps"`
 	MatchCoef     *float64 `json:"match_coef"`
@@ -573,6 +574,7 @@ type Stats struct {
 	NFillLag      int      `json:"n_fill_lag"`
 	NClockSkip    int      `json:"n_clock_skip"`
 	NSL           int      `json:"n_sl"`
+	Forecast      Forecast `json:"forecast"`
 }
 
 func (s *Store) ComputeStats(ctx context.Context) (Stats, error) {
@@ -589,24 +591,38 @@ WHERE quote_source != '' AND quote_ts IS NOT NULL
 		st.Coverage = float64(st.NQuoted) / float64(st.NWindows)
 	}
 	var wins int
-	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM windows WHERE pnl_usd IS NOT NULL AND pnl_usd > 0`).Scan(&wins)
+	_ = s.DB.QueryRowContext(ctx, `
+SELECT COUNT(1) FROM windows
+WHERE side IN ('long','short') AND lighter_entry_px IS NOT NULL AND pnl_usd IS NOT NULL AND pnl_usd > 0`).Scan(&wins)
+	var meanBps, meanPnL sql.NullFloat64
+	_ = s.DB.QueryRowContext(ctx, `
+SELECT AVG(ret_bps), AVG(pnl_usd) FROM windows
+WHERE side IN ('long','short') AND lighter_entry_px IS NOT NULL
+  AND ret_bps IS NOT NULL AND pnl_usd IS NOT NULL`).Scan(&meanBps, &meanPnL)
 	if st.NTrades > 0 {
 		st.WR = float64(wins) / float64(st.NTrades)
-		_ = s.DB.QueryRowContext(ctx, `SELECT AVG(ret_bps) FROM windows WHERE ret_bps IS NOT NULL`).Scan(&st.MeanBps)
+	}
+	if meanBps.Valid {
+		st.MeanBps = meanBps.Float64
+	}
+	if meanPnL.Valid {
+		st.MeanPnLUSD = meanPnL.Float64
 	}
 	var livePaired, shadowPaired sql.NullFloat64
 	_ = s.DB.QueryRowContext(ctx, `
 SELECT COUNT(1), AVG(ret_bps), AVG(shadow_ret_bps)
 FROM windows
 WHERE lighter_entry_px IS NOT NULL AND ret_bps IS NOT NULL AND shadow_ret_bps IS NOT NULL`).Scan(&st.NPaired, &livePaired, &shadowPaired)
+	// Gap/match use paired means; headline mean_bps stays all closed trades.
+	var pairedLiveMean float64
 	if livePaired.Valid {
-		st.MeanBps = livePaired.Float64
+		pairedLiveMean = livePaired.Float64
 	}
 	if shadowPaired.Valid {
 		st.ShadowMeanBps = shadowPaired.Float64
 	}
 	if livePaired.Valid && shadowPaired.Valid {
-		st.GapBps, st.MatchCoef = LiveShadowGap(livePaired.Float64, shadowPaired.Float64)
+		st.GapBps, st.MatchCoef = LiveShadowGap(pairedLiveMean, shadowPaired.Float64)
 	}
 	const tradeLag = `side IN ('long','short') AND lighter_entry_px IS NOT NULL AND fill_lag_ms IS NOT NULL`
 	st.P50LagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.50)
@@ -618,6 +634,24 @@ WHERE lighter_entry_px IS NOT NULL AND ret_bps IS NOT NULL AND shadow_ret_bps IS
 	}
 	st.P50FillLagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.50)
 	st.P90FillLagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.90)
+
+	var sampleFrom, sampleTo sql.NullInt64
+	_ = s.DB.QueryRowContext(ctx, `SELECT MIN(window_ts), MAX(window_ts) FROM windows`).Scan(&sampleFrom, &sampleTo)
+	var equity float64
+	_ = s.DB.QueryRowContext(ctx, `
+SELECT equity FROM equity_snapshots WHERE source='live' ORDER BY ts DESC LIMIT 1`).Scan(&equity)
+	if equity <= 0 {
+		_ = s.DB.QueryRowContext(ctx, `
+SELECT equity_after FROM windows WHERE equity_after IS NOT NULL ORDER BY window_ts DESC LIMIT 1`).Scan(&equity)
+	}
+	var fromTS, toTS int64
+	if sampleFrom.Valid {
+		fromTS = sampleFrom.Int64
+	}
+	if sampleTo.Valid {
+		toTS = sampleTo.Int64
+	}
+	st.Forecast = BuildForecast(equity, st.NTrades, st.NWindows, wins, st.MeanBps, st.MeanPnLUSD, fromTS, toTS)
 	return st, nil
 }
 

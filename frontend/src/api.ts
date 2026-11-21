@@ -66,6 +66,30 @@ export type Status = {
   last_timings?: WindowTimings | null;
 };
 
+export type Forecast = {
+  ready: boolean;
+  equity_now: number;
+  mean_pnl_usd: number;
+  mean_bps: number;
+  wr: number;
+  trades_per_day: number;
+  trade_rate: number;
+  n_trades: number;
+  n_windows: number;
+  sample_hours: number;
+  sample_from_ts: number;
+  sample_to_ts: number;
+  equity_1w: number;
+  equity_1m: number;
+  equity_1y: number;
+  ret_1w_pct: number;
+  ret_1m_pct: number;
+  ret_1y_pct: number;
+  confidence: "low" | "medium" | "high" | string;
+  confidence_score: number;
+  note: string;
+};
+
 export type Stats = {
   n_windows: number;
   n_quoted: number;
@@ -75,6 +99,7 @@ export type Stats = {
   coverage: number;
   wr: number;
   mean_bps: number;
+  mean_pnl_usd: number;
   shadow_mean_bps: number;
   gap_bps: number;
   match_coef: number | null;
@@ -86,6 +111,7 @@ export type Stats = {
   n_fill_lag: number;
   n_clock_skip: number;
   n_sl: number;
+  forecast: Forecast;
 };
 
 export type NullF = { Float64: number; Valid: boolean } | number | null;

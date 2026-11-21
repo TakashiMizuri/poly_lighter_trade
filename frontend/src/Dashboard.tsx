@@ -4,6 +4,7 @@ import { Line, LineChart, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis
 import {
   EventRow,
   EquityPoint,
+  Forecast,
   OrderRow,
   Stats,
   Status,
@@ -359,6 +360,8 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
               </CardContent>
             </Card>
 
+            <ForecastCard forecast={stats?.forecast} liveEquity={status.equity} />
+
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <Stat label="Equity Lighter" value={`$${fmt(status.equity)}`} hint="Живой счёт" />
               <Stat label="Пик / тень Binance" value={`$${fmt(status.peak_equity)} / $${fmt(status.shadow_equity)}`} hint="Тень — research T+1s, не Lighter" />
@@ -614,6 +617,65 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
         {hint ? <div className="mt-1 text-[11px] leading-snug text-muted-foreground">{hint}</div> : null}
       </CardContent>
     </Card>
+  );
+}
+
+function confidenceLabel(c: string | undefined) {
+  if (c === "high") return "высокая";
+  if (c === "medium") return "средняя";
+  return "низкая";
+}
+
+function ForecastCard({ forecast, liveEquity }: { forecast?: Forecast; liveEquity?: number }) {
+  const f = forecast;
+  const base = liveEquity && liveEquity > 0 ? liveEquity : f?.equity_now;
+  const scale = f && f.equity_now > 0 && base && base > 0 ? base / f.equity_now : 1;
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm">Прогноз баланса</CardTitle>
+        <p className="text-xs text-muted-foreground">
+          Модель: equity × (1 + mean_bps/10⁴)^(сделок/день × дни). Частота и mean — по накопленным окнам; после
+          сброса шумит, с ростом выборки стабилизируется.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {!f || !f.ready ? (
+          <p className="text-sm text-muted-foreground">{f?.note || "Нужны закрытые сделки, чтобы строить прогноз."}</p>
+        ) : (
+          <>
+            <div className="grid grid-cols-3 gap-3">
+              <ForecastHorizon label="Неделя" equity={f.equity_1w * scale} retPct={f.ret_1w_pct} />
+              <ForecastHorizon label="Месяц" equity={f.equity_1m * scale} retPct={f.ret_1m_pct} />
+              <ForecastHorizon label="Год" equity={f.equity_1y * scale} retPct={f.ret_1y_pct} />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              База ${fmt(base)} · {f.n_trades} сделок · {fmt(f.trades_per_day, 2)}/день · доля окон{" "}
+              {fmt(f.trade_rate * 100, 1)}% · WR {fmt(f.wr * 100, 1)}% · mean {fmt(f.mean_bps, 1)} bps (
+              {fmt(f.mean_pnl_usd, 3)}$) · выборка {fmt(f.sample_hours, 1)} ч · надёжность {confidenceLabel(f.confidence)}{" "}
+              ({fmt(f.confidence_score * 100, 0)}%)
+            </p>
+            <p className="text-[11px] leading-snug text-muted-foreground">{f.note}</p>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ForecastHorizon({ label, equity, retPct }: { label: string; equity: number; retPct: number }) {
+  const tone =
+    retPct > 0 ? "text-emerald-700" : retPct < 0 ? "text-red-700" : "text-foreground";
+  const sign = retPct > 0 ? "+" : "";
+  return (
+    <div>
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className={`text-lg font-medium tabular-nums ${tone}`}>${fmt(equity)}</div>
+      <div className={`text-xs tabular-nums ${tone}`}>
+        {sign}
+        {fmt(retPct, 1)}%
+      </div>
+    </div>
   );
 }
 
