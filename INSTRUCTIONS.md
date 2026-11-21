@@ -373,54 +373,42 @@ poly.example.com {
 
 Менял `.env` (включая `STOP_PRICE_PCT`) или образ → **`--force-recreate`**, не голый `restart`. Перед обновлением проверь, что в `.env` присутствует ненулевой `STOP_PRICE_PCT` (для старого файла добавь `STOP_PRICE_PCT=0.00125`). Если ты выставил `MARKET_SLIPPAGE=0.0005` по моей прежней инструкции, верни `MARKET_SLIPPAGE=0.02`: 5 bps были необоснованным ужесточением и могли мешать IOC-входу. Редактируй именно `.env`, сохраняя секреты; не копируй поверх него `.env.example`. Также проверь `PM_PREWARM_SECONDS=15` (допустимо 15–120).
 Бот отправляет защитный reduce-only стоп после подтверждения fill (trades по client id / tx hash **и** позиция, до ~5 с). Если REST отстаёт, это больше не помечается как `entry_unfilled` за 300 мс. Если отправка стопа не удалась, он пытается закрыть позицию и уходит в HALT. Это аварийная реакция, а не гарантия исполнения при отказе сети или биржи.
-`KILL_SWITCH=false` в файле ≠ в уже бегущем процессе. HALT в SQLite (`halted` / `kill_switch`) переживает рестарт контейнера — после выката с `entry_unconfirmed` нужен `/resume`, иначе входы так и будут `skip/halt`.
+`KILL_SWITCH=false` в файле ≠ в уже бегущем процессе: HALT живёт в SQLite. После **полного сброса `data/`** (ниже) HALT пропадает вместе с историей окон; `/resume` не нужен.
 
-### Сброс HALT + подтянуть + перезапуск (SSH, бот можно не останавливать заранее)
+### Полный сброс данных + код + перезапуск (SSH)
 
-Перед `/resume` на Lighter UI: позиция **FLAT**, нет висящих ордеров, нет второго процесса/вкладки с тем же API-ключом.
+Стирает SQLite, WAL, логи приложения, docker-логи контейнеров. **Не** трогает `.env` и ключи. Перед запуском на Lighter UI: позиция **FLAT**, нет висящих ордеров, нет второго процесса/вкладки с тем же API-ключом. На старте бот всё равно попытается flatten.
+
+Вставь весь блок:
 
 ```bash
 cd /opt/poly-lighter || exit 1
+set -euo pipefail
 
-# биржа: нет позиции / ордеров
-# затем бэкап БД (бот может работать)
+# 1) остановить бота (Donchian не трогаем)
+docker compose down
+
+# 2) бэкап data + .env, затем полный wipe данных
 mkdir -p backups
-python3 - backups/bot-preupdate-$(date -u +%Y%m%dT%H%M%SZ).db <<'PY'
-import sqlite3, sys
-src = sqlite3.connect("file:/opt/poly-lighter/data/bot.db?mode=ro", uri=True, timeout=30)
-dst = sqlite3.connect(sys.argv[1])
-src.backup(dst)
-dst.close(); src.close()
-print("backup ok", sys.argv[1])
-PY
+tar czf "backups/data-$(date -u +%Y%m%dT%H%M%SZ).tgz" data .env
+rm -rf data
+mkdir -p data
 
+# 3) код
 git fetch origin
 git checkout main
 git pull --ff-only
 git log -1 --oneline
 
-docker compose up -d --build --force-recreate bot web
+# 4) собрать и поднять с пустой БД
+docker compose up -d --build --force-recreate --remove-orphans bot web
 docker compose ps
 docker compose logs --tail=80 bot
 ```
 
-В логе boot должно быть `POLY_LIGHTER_1 онлайн`. Пока HALT в БД, окна будут `skip reason=halt` — это ожидаемо.
+Ожидай `POLY_LIGHTER_1 онлайн` и health без `HALT`. Дашборд :8081 — пустая история окон. Telegram `/status`.
 
-Снять HALT (одно из):
-
-- Telegram: `/status` затем `/resume`
-- дашборд :8081 — Resume
-- если Telegram недоступен, после проверки что позиция flat:
-
-```bash
-cd /opt/poly-lighter
-docker compose exec -T bot wget -qO- http://127.0.0.1:8080/api/health
-# если health = HALT entry_unconfirmed — resume с дашборда/Telegram, не правь bot.db руками
-```
-
-SQLite стирать **не нужно**: история окон пусть остаётся. Полный wipe `data/` — только §13, если БД реально сломана.
-
-Откат: `git log -5 --oneline`, `git checkout <коммит>`, снова `up -d --build --force-recreate`.
+Откат кода: `git log -5 --oneline`, `git checkout <коммит>`, снова `up -d --build --force-recreate`. Данные — из `backups/data-*.tgz`.
 
 ---
 
@@ -475,34 +463,7 @@ docker compose logs -f web
 
 ### Полный сброс данных + обновление кода (VPS)
 
-Стирает SQLite, логи, кривую истории окон. **Не** трогает `.env` и ключи. Позицию на Lighter бот при старте всё равно flatten.
-
-```bash
-cd /opt/poly-lighter
-
-# 1) остановить
-docker compose down
-
-# 2) бэкап на всякий
-mkdir -p backups
-tar czf "backups/data-$(date -u +%Y%m%dT%H%M%SZ).tgz" data .env
-ls -lh backups | tail
-
-# 3) код
-git fetch origin
-git checkout main
-git pull --ff-only
-git log -1 --oneline
-
-# 4) стереть данные бота (не .env)
-rm -rf data
-mkdir -p data
-
-# 5) собрать и поднять
-docker compose up -d --build --force-recreate bot web
-docker compose ps
-docker compose logs -f --tail=80 bot
-```
+Тот же wipe, что в §11: SQLite, логи, история окон. **Не** трогает `.env` и ключи. Если уже сделал блок из §11 — повторять не нужно.
 
 Дашборд :8081 — вкладки **Часы** (UTC/Binance vs исполнение Lighter) и широкая таблица окон. Telegram `/status` показывает `clock_binance`.
 
