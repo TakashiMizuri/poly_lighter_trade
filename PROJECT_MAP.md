@@ -3,7 +3,7 @@
 Краткая навигация для ИИ и людей. Детали стратегии — в `docs/`, деплой — в `INSTRUCTIONS.md`.  
 **Обновляй эту карту**, когда меняется структура, ответственность пакетов или критичные потоки.
 
-Последняя актуализация: 2026-11-21 (engine split + STRATEGY_IMPLEMENTATION_RU).
+Последняя актуализация: 2026-11-21 (exit flatness 3-way + stop watchdog keep-stop).
 
 ---
 
@@ -86,7 +86,7 @@ main.go
 
 | Пакет | Ответственность | Ключевые файлы |
 |-------|-----------------|----------------|
-| `engine` | Оркестрация окна, позиции, halt/kill, timing traces | `engine.go` (types), `lifecycle.go`, `entry.go`, `exit.go`, `risk.go`, `shadow.go`, `persist.go`, `trace.go`, `snapshot.go` |
+| `engine` | Оркестрация окна, позиции, halt/kill, timing traces | `engine.go` (types), `lifecycle.go`, `entry.go`, `exit.go` (flatness/settle/watchdog), `risk.go`, `shadow.go`, `persist.go`, `trace.go`, `snapshot.go` |
 | `strategy` | Порог/спред → side; stop price; lot floor | `gate.go`, `stop.go` |
 | `exchange/lighter` | REST, SendTx, подпись ордеров, fills/tape, ambiguous submit | `http.go`, `signer.go`, `trades.go`, `ambiguous.go` |
 | `polymarket` | Событие/slug, book quotes | `client.go` |

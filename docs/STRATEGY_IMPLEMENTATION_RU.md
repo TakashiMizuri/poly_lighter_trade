@@ -271,17 +271,25 @@ ts+300                must be flat; иначе exit_late (+ streak → HALT)
 
 Каждую ~1s:
 
-- `detectExit`: grace 5s после `ArmedAt`; нужен `SeenAcctOpen`; flat → VWAP closing fills → `stop` или `closed_away`.
+- `detectExit`: grace 2s после `ArmedAt`; `SeenAcctOpen` выставляется при первом confirmed open; flat без ever-open допускается только после age≥5s (DNS мог скрыть open). Flat → VWAP closing fills → `stop` / `closed_away`.
+- `resolveStopWatchdog` (live): last/mark `StopHit` → poll account ~350ms. Flat → settle remote (tape VWAP, без market close). Open → settle residual (CancelAll + market). Unknown → settle keep-stop (market **без** CancelAll, чтобы не убить live SL). Grace 2s.
 - Age &gt; `HaltPositionMax` (default 6m) → halt + settle `halt_age`.
 - `now ≥ ts+300−ExitEarly` → settle window close.
 - Prewarm следующего окна, если позиция ещё жива.
 
-### 5.7 EXIT / SETTLE (`settleWindow`)
+### 5.7 EXIT / SETTLE (`settleWindow` → `finalizePosition`)
+
+Flatness **трёхзначная**: `flat` / `open` / `unknown` (сеть). Ошибка DNS ≠ «ещё в позиции».
 
 1. State `FLATTENING`.
-2. Если уже flat → CancelAll.
-3. Иначе cancel stop + `sendMarketClose` reduce-only.
-4. Retry close; не flat к границе → `exit_late` + `bumpLateStreak`.
+2. Для `stop`/`closed_away` — сначала tape VWAP (предпочтительнее last/mark).
+3. План close (`planSettleClose`):
+   - confirmed flat → CancelAll residual, без market;
+   - stop/remote + confirmed open → CancelAll + market;
+   - stop/remote + unknown + есть stop tape → как flat (не дублировать close);
+   - stop/remote + unknown без tape → market **без** CancelAll;
+   - window/halt → CancelAll + market.
+4. `exit_late` + `bumpLateStreak` **только** если финальный poll = confirmed open. Unknown → alert `exit_flat_unknown`, streak не трогаем.
 5. PnL, `ExitReason`: `sl` | `closed_away` | `halt` | `window_close` | …
 6. `pos=nil`, shadow async, `waitNextOpen(next)`.
 
@@ -322,7 +330,8 @@ fill OK ───────────────────► place stop
 stop fill / stop-like close ──► settle sl
 remote close не стопом ───────► closed_away (часто чужой процесс на аккаунте)
 до exitAt без стопа ──────────► cancel stop → window_close
-не flat к ts+300 ─────────────► exit_late (+ streak→HALT)
+confirmed open к ts+300 ──────► exit_late (+ streak→HALT)
+flatness unknown ─────────────► warn exit_flat_unknown (не streak)
 age > HaltPositionMax ────────► halt_age
 kill / halt / disconnect ─────► flatten first
 ```
@@ -372,7 +381,7 @@ bootWindow mid-window ──► ждать следующего open (не до�
 | `closed_away` | закрыто не стопом |
 | `halt` / `halt_age` | стоп-кран / возраст |
 | `skip` | окно без позиции |
-| `exit_late` | не успели flat к границе (часто join) |
+| `exit_late` | confirmed open к границе (не DNS/unknown) |
 
 ---
 
@@ -460,7 +469,7 @@ main → Bootstrap → Run
 | Канон | `_1_1` со стопом | Live следует `_1_1` |
 | README historically | one-liner без стопа | должен ссылаться на `_1_1` + этот файл |
 | Clock gate `_1` | skip если Binance offset &gt;1s | код: host UTC; Binance не блокирует вход (`_1_1`) |
-| Local stop watchdog | SLA &lt;200ms | exchange stop + `detectExit` + local `StopHit` на last/mark в `tick` |
+| Local stop watchdog | SLA &lt;200ms | exchange stop + `detectExit` + `resolveStopWatchdog` (poll flat → remote/residual/keep-stop); `exit_late` только на confirmed open |
 | HALT 10 окон без стопа | в `_1_1` | заменено на immediate `stop_missing` |
 | Gamma synthetic book | CLOB канон | live gate: только WS/REST CLOB; Gamma mid не подставляет synthetic book |
 | Dry-run stop | risk model со стопом | paper path ставит `stop_loss` dry_run + `StopPx` в позиции |

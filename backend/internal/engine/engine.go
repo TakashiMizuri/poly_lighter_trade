@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"time"
@@ -81,6 +82,11 @@ type Engine struct {
 	readyOK     bool
 	tr          *winTrace
 	lastTimings *store.Timings
+
+	// Test seams (nil in production).
+	flatProbe   func(context.Context) (bool, lighter.Position, error)
+	pxProbe     func(context.Context) (float64, error)
+	skipWaitNext bool
 }
 
 func New(cfg *config.Config, st *store.Store, httpClient *lighter.HTTPClient, signer *lighter.Signer, markets map[string]lighter.MarketMeta, pm *polymarket.Client, bn *binance.Client, n notify.Notifier, log *slog.Logger) *Engine {

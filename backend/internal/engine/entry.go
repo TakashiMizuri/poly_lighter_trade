@@ -206,6 +206,8 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		e.pos = &livePos{
 			WindowTS: ts, Side: side, Qty: qty, Notional: qty * px, EntryPx: px, EntryTS: e.unix(),
 			EquityBefore: eq, ClientIdx: clientIdx, StopClientIdx: stopIdx, StopPx: stopPx, ArmedAt: time.Now(),
+			// Paper path: treat as observed open so dry-run detectExit/stop can settle.
+			SeenAcctOpen: true,
 		}
 		e.mu.Unlock()
 		w.LighterEntryTS = sql.NullFloat64{Float64: e.unix(), Valid: true}

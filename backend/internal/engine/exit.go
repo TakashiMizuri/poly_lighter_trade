@@ -13,80 +13,105 @@ import (
 	"poly-lighter.trade/bot/internal/strategy"
 )
 
+// accountFlat is three-valued: network errors are Unknown, never "still open".
+type accountFlat struct {
+	Known bool
+	Flat  bool
+	Pos   lighter.Position
+}
+
 func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, px, fee float64) error {
+	if err := e.finalizePosition(ctx, pos, reason, px, fee); err != nil {
+		return err
+	}
+	if e.skipWaitNext {
+		return nil
+	}
+	return e.waitNextOpen(ctx, pos.WindowTS+clock.WindowSec)
+}
+
+// finalizePosition closes/reconciles the live position and books the window.
+// Invariant: exit_late / late_streak only when account is *confirmed* still open.
+func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason string, px, fee float64) error {
 	e.setState(StateFlattening)
 	late := false
 	deadline := time.Unix(pos.WindowTS, 0).UTC().Add(time.Duration(clock.WindowSec) * time.Second)
+	// Within 2s of (or past) the window boundary: prefer speed over extra account polls.
 	nextSoon := !e.now().Before(deadline.Add(-2 * time.Second))
-	alreadyFlat := false
+
+	// Prefer exchange tape over last/mark for stop / remote-close paths.
+	var fromTape bool
+	px, fee, reason, fromTape = e.resolveExitTape(ctx, pos, reason, px, fee, nextSoon)
+
+	flat := accountFlat{}
 	if !nextSoon {
-		if flat, _, err := e.isFlat(ctx); err == nil && flat {
-			alreadyFlat = true
-		}
+		flat = e.pollAccountFlat(ctx, 400*time.Millisecond)
 	}
-	if px <= 0 && !nextSoon {
-		if p, q, f, sl := e.closingTradeVWAP(ctx, pos); q > 0 {
-			px, fee = p, f
-			if reason == "" && sl {
-				reason = "stop"
-			}
-		}
-	}
-	if reason == "stop" && px > 0 {
-		_ = e.Store.InsertOrder(ctx, pos.WindowTS, "stop_loss_fill", "filled", pos.StopClientIdx, "", pos.Qty, px, map[string]any{"stop_px": pos.StopPx, "sl_slip_bps": strategy.SLSlipBps(pos.EntryPx, px, pos.Side, e.Cfg.StopPricePct)})
-	}
+
+	plan := planSettleClose(reason, flat, fromTape)
 	fillWait := 800 * time.Millisecond
 	if nextSoon {
 		fillWait = 0
 	}
-	if alreadyFlat {
-		if e.Signer != nil {
-			if err := e.Signer.CancelAll(ctx); err != nil {
-				e.Log.Warn("cancel residual after remote close", "err", err)
-			}
-		}
-	} else if reason == "stop" || reason == "closed_away" {
-		e.Log.Warn("account still open after detected close, flattening", "reason", reason)
-		cpx, cfee, err := e.sendMarketClose(ctx, pos, fillWait)
-		if err != nil {
-			e.alert(ctx, "error", "flatten", err.Error())
-		}
-		if cpx > 0 {
-			px, fee = cpx, fee+cfee
-		}
-	} else {
-		if pos.StopClientIdx > 0 && e.Signer != nil {
-			if err := e.Signer.CancelAll(ctx); err != nil {
-				e.Log.Warn("cancel stop before window close", "err", err)
-			}
-		}
-		cpx, cfee, err := e.sendMarketClose(ctx, pos, fillWait)
-		if err != nil {
-			e.alert(ctx, "error", "flatten", err.Error())
-		}
-		if cpx > 0 {
-			px, fee = cpx, cfee
+
+	if plan.CancelAll && e.Signer != nil {
+		if err := e.Signer.CancelAll(ctx); err != nil {
+			e.Log.Warn("cancel orders during settle", "err", err, "reason", reason, "mode", plan.Mode)
 		}
 	}
-	if !nextSoon {
-		retryUntil := e.now().Add(500 * time.Millisecond)
-		for !alreadyFlat && e.now().Before(retryUntil) {
-			flat, _, err := e.isFlat(ctx)
-			if err == nil && flat {
-				break
-			}
-			late = e.now().After(deadline)
-			cpx, cfee, _ := e.sendMarketClose(ctx, pos, 0)
-			if cpx > 0 {
-				px = cpx
-				fee += cfee
-			}
-			time.Sleep(150 * time.Millisecond)
+	if plan.MarketClose {
+		if plan.Mode == settleCloseResidual {
+			e.Log.Warn("account still open after detected close, flattening", "reason", reason)
+		} else if plan.Mode == settleCloseKeepStop {
+			e.Log.Warn("flatten without cancel: account flatness unknown after stop", "reason", reason)
 		}
-		if flat, _, err := e.isFlat(ctx); err != nil || !flat {
+		cpx, cfee, err := e.sendMarketClose(ctx, pos, fillWait)
+		if err != nil {
+			e.alert(ctx, "error", "flatten", err.Error())
+		}
+		if cpx > 0 {
+			if plan.Mode == settleCloseResidual || plan.Mode == settleCloseKeepStop {
+				px, fee = cpx, fee+cfee
+			} else {
+				px, fee = cpx, cfee
+			}
+		}
+	}
+
+	if !nextSoon {
+		if plan.Mode != settleCloseRemoteFlat {
+			retryUntil := e.now().Add(500 * time.Millisecond)
+			for e.now().Before(retryUntil) {
+				cur := e.pollAccountFlat(ctx, 0)
+				if cur.Known && cur.Flat {
+					flat = cur
+					break
+				}
+				// Only hammer market closes when still open or flatness unknown.
+				if !cur.Known || !cur.Flat {
+					cpx, cfee, _ := e.sendMarketClose(ctx, pos, 0)
+					if cpx > 0 {
+						px = cpx
+						fee += cfee
+					}
+				}
+				time.Sleep(150 * time.Millisecond)
+			}
+		}
+		final := e.pollAccountFlat(ctx, 250*time.Millisecond)
+		switch {
+		case final.Known && !final.Flat:
 			late = true
 			e.alert(ctx, "error", "exit_late", "не удалось закрыть к границе")
+		case !final.Known:
+			// DNS/timeout after a close attempt is not proof we missed the deadline.
+			e.Log.Warn("exit flatness unconfirmed after settle")
+			e.alert(ctx, "warn", "exit_flat_unknown", "позиция после выхода не подтверждена (сеть); late_streak не трогаем")
 		}
+	}
+
+	if reason == "stop" && px > 0 {
+		_ = e.Store.InsertOrder(ctx, pos.WindowTS, "stop_loss_fill", "filled", pos.StopClientIdx, "", pos.Qty, px, map[string]any{"stop_px": pos.StopPx, "sl_slip_bps": strategy.SLSlipBps(pos.EntryPx, px, pos.Side, e.Cfg.StopPricePct)})
 	}
 	if px <= 0 {
 		px, _ = e.btcPx(ctx)
@@ -160,7 +185,73 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 		e.refineExitAsync(pos, pos.ExitClientIdx, pos.ExitHash)
 	}
 	e.shadowAsync(pos.WindowTS)
-	return e.waitNextOpen(ctx, pos.WindowTS+clock.WindowSec)
+	return nil
+}
+
+type settleCloseMode int
+
+const (
+	settleCloseRemoteFlat settleCloseMode = iota // confirmed flat: cancel residual only
+	settleCloseResidual                          // stop/remote detected but still open: cancel + market
+	settleCloseKeepStop                          // stop path, flatness unknown: market, leave SL live
+	settleCloseWindow                            // normal window/halt exit: cancel stop + market
+)
+
+type settleClosePlan struct {
+	Mode        settleCloseMode
+	CancelAll   bool
+	MarketClose bool
+}
+
+// planSettleClose decides cancel/close actions from reason + three-valued flatness.
+// stopTape means we already matched a closing/stop fill on the trades tape — that
+// is stronger evidence than a failed account read, so we must not market-close again.
+func planSettleClose(reason string, flat accountFlat, stopTape bool) settleClosePlan {
+	remote := reason == "stop" || reason == "closed_away"
+	if flat.Known && flat.Flat {
+		return settleClosePlan{Mode: settleCloseRemoteFlat, CancelAll: true, MarketClose: false}
+	}
+	if remote {
+		if flat.Known && !flat.Flat {
+			return settleClosePlan{Mode: settleCloseResidual, CancelAll: true, MarketClose: true}
+		}
+		if stopTape {
+			return settleClosePlan{Mode: settleCloseRemoteFlat, CancelAll: true, MarketClose: false}
+		}
+		// Unknown and no tape yet: do NOT CancelAll — that races a live exchange SL.
+		return settleClosePlan{Mode: settleCloseKeepStop, CancelAll: false, MarketClose: true}
+	}
+	return settleClosePlan{Mode: settleCloseWindow, CancelAll: true, MarketClose: true}
+}
+
+func (e *Engine) resolveExitTape(ctx context.Context, pos *livePos, reason string, px, fee float64, nextSoon bool) (float64, float64, string, bool) {
+	wantTape := reason == "stop" || reason == "closed_away" || px <= 0
+	if !wantTape {
+		return px, fee, reason, false
+	}
+	if p, q, f, sl := e.closingTradeVWAP(ctx, pos); q > 0 {
+		px, fee = p, f
+		if sl && (reason == "" || reason == "stop" || reason == "closed_away") {
+			reason = "stop"
+		}
+		return px, fee, reason, true
+	}
+	if nextSoon || e.HTTP == nil || (reason != "stop" && reason != "closed_away") {
+		return px, fee, reason, false
+	}
+	// Native SL fill often lands in trades a beat after account goes flat.
+	wait := 800 * time.Millisecond
+	wctx, cancel := context.WithTimeout(context.Background(), wait)
+	p, q, f, sl := e.waitClosingVWAP(wctx, pos)
+	cancel()
+	if q > 0 {
+		px, fee = p, f
+		if sl || reason == "stop" {
+			reason = "stop"
+		}
+		return px, fee, reason, true
+	}
+	return px, fee, reason, false
 }
 
 func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64, err error) {
@@ -365,6 +456,9 @@ func (e *Engine) waitOpenPosition(ctx context.Context) (lighter.Position, error)
 }
 
 func (e *Engine) isFlat(ctx context.Context) (bool, lighter.Position, error) {
+	if e.flatProbe != nil {
+		return e.flatProbe(ctx)
+	}
 	if e.HTTP == nil {
 		return true, lighter.Position{}, nil
 	}
@@ -380,18 +474,44 @@ func (e *Engine) isFlat(ctx context.Context) (bool, lighter.Position, error) {
 	return false, p, nil
 }
 
+// pollAccountFlat retries until flatness is known or budget expires.
+// budget<=0 → single attempt.
+func (e *Engine) pollAccountFlat(ctx context.Context, budget time.Duration) accountFlat {
+	deadline := time.Now()
+	if budget > 0 {
+		deadline = deadline.Add(budget)
+	}
+	var last accountFlat
+	for {
+		flat, pos, err := e.isFlat(ctx)
+		if err == nil {
+			return accountFlat{Known: true, Flat: flat, Pos: pos}
+		}
+		last = accountFlat{}
+		if budget <= 0 || !time.Now().Before(deadline) {
+			return last
+		}
+		select {
+		case <-ctx.Done():
+			return last
+		case <-time.After(80 * time.Millisecond):
+		}
+	}
+}
+
 func (e *Engine) detectExit(ctx context.Context, pos *livePos) (reason string, px, fee float64, ok bool) {
 	if pos == nil {
 		return "", 0, 0, false
 	}
-	if !pos.ArmedAt.IsZero() && time.Since(pos.ArmedAt) < 5*time.Second {
+	// Brief grace: account/tape lag right after fill+stop placement.
+	if !pos.ArmedAt.IsZero() && time.Since(pos.ArmedAt) < 2*time.Second {
 		return "", 0, 0, false
 	}
-	flat, _, err := e.isFlat(ctx)
-	if err != nil {
+	fr := e.pollAccountFlat(ctx, 0)
+	if !fr.Known {
 		return "", 0, 0, false
 	}
-	if !flat {
+	if !fr.Flat {
 		e.mu.Lock()
 		if e.pos != nil {
 			e.pos.SeenAcctOpen = true
@@ -399,8 +519,13 @@ func (e *Engine) detectExit(ctx context.Context, pos *livePos) (reason string, p
 		e.mu.Unlock()
 		return "", 0, 0, false
 	}
+	// Flat without ever observing open: only trust after enough age so a stale
+	// post-entry flat reading cannot look like a remote close. If DNS hid the
+	// whole open period, age≥5s still lets us settle a native SL.
 	if !pos.SeenAcctOpen {
-		return "", 0, 0, false
+		if pos.ArmedAt.IsZero() || time.Since(pos.ArmedAt) < 5*time.Second {
+			return "", 0, 0, false
+		}
 	}
 	// Trades REST often lags DNS/account. Do not book last/mark as the exit.
 	wait := 2500 * time.Millisecond
@@ -420,6 +545,55 @@ func (e *Engine) detectExit(ctx context.Context, pos *livePos) (reason string, p
 		return "stop", px, fee, true
 	}
 	return "closed_away", px, fee, true
+}
+
+// resolveStopWatchdog is the local SLA backup when last/mark crosses stop.
+// It must not CancelAll while flatness is unknown (that races a live exchange SL).
+func (e *Engine) resolveStopWatchdog(ctx context.Context, pos *livePos) (reason string, px, fee float64, ok bool) {
+	if pos == nil || pos.StopPx <= 0 {
+		return "", 0, 0, false
+	}
+	if !pos.ArmedAt.IsZero() && time.Since(pos.ArmedAt) < 2*time.Second {
+		return "", 0, 0, false
+	}
+	last, err := e.btcPx(ctx)
+	if err != nil || !strategy.StopHit(last, pos.Side, pos.StopPx) {
+		return "", 0, 0, false
+	}
+	e.Log.Warn("local stop watchdog hit", "px", last, "stop", pos.StopPx, "side", pos.Side)
+
+	// Let a live native SL report flat before we send our own market close.
+	fr := e.pollAccountFlat(ctx, 350*time.Millisecond)
+	switch {
+	case fr.Known && fr.Flat:
+		px, fee = last, 0
+		if e.HTTP != nil {
+			wait := 800 * time.Millisecond
+			exitAt := time.Unix(pos.WindowTS, 0).UTC().Add(time.Duration(clock.WindowSec)*time.Second - e.Cfg.ExitEarly)
+			if remain := exitAt.Sub(e.now()); remain > 0 && remain < wait {
+				wait = remain
+			}
+			wctx, cancel := context.WithTimeout(context.Background(), wait)
+			p, q, f, sl := e.waitClosingVWAP(wctx, pos)
+			cancel()
+			if q > 0 {
+				px, fee = p, f
+				if sl || (pos.StopPx > 0 && strategy.StopLikeFill(p, pos.Side, pos.StopPx)) {
+					return "stop", px, fee, true
+				}
+				return "closed_away", px, fee, true
+			}
+		}
+		return "stop", px, fee, true
+	case fr.Known && !fr.Flat:
+		// True residual — settleWindow will CancelAll + market close.
+		return "stop", last, 0, true
+	default:
+		// Unknown: still settle, but settleWindow keeps the exchange SL alive
+		// (market close without CancelAll). Near-boundary ticks must not stall.
+		e.Log.Warn("stop watchdog: account flatness unknown; market close without cancel")
+		return "stop", last, 0, true
+	}
 }
 
 func (e *Engine) waitClosingVWAP(ctx context.Context, pos *livePos) (px, qty, fee float64, sl bool) {

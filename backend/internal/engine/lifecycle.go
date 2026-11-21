@@ -90,11 +90,15 @@ func (e *Engine) tick(ctx context.Context) error {
 				return e.settleWindow(ctx, pos, reason, px, fee)
 			}
 		}
-		// Local stop watchdog (SLA): if mark/last crossed stop and exchange
-		// stop has not flattened yet, flatten immediately.
-		if pos.StopPx > 0 {
+		// Local stop watchdog (SLA backup for native SL). Polls flatness first
+		// so we do not CancelAll a live exchange stop on DNS flaps.
+		if !e.Cfg.DryRun && e.Signer != nil {
+			if reason, px, fee, ok := e.resolveStopWatchdog(ctx, pos); ok {
+				return e.settleWindow(ctx, pos, reason, px, fee)
+			}
+		} else if e.Cfg.DryRun && pos.StopPx > 0 {
 			if px, err := e.btcPx(ctx); err == nil && strategy.StopHit(px, pos.Side, pos.StopPx) {
-				e.Log.Warn("local stop watchdog hit", "px", px, "stop", pos.StopPx, "side", pos.Side)
+				e.Log.Info("dry-run stop hit", "px", px, "stop", pos.StopPx, "side", pos.Side)
 				return e.settleWindow(ctx, pos, "stop", px, 0)
 			}
 		}

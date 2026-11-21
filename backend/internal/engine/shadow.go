@@ -32,6 +32,9 @@ func (e *Engine) equity(ctx context.Context) (float64, error) {
 }
 
 func (e *Engine) btcPx(ctx context.Context) (float64, error) {
+	if e.pxProbe != nil {
+		return e.pxProbe(ctx)
+	}
 	if e.HTTP == nil {
 		return e.BN.Close1s(ctx, "BTCUSDT", e.now().Unix())
 	}
