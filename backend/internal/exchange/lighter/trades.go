@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -145,6 +146,33 @@ func FillsMatching(fills []Fill, clientIdx int64, txHash string) []Fill {
 		return subset
 	}
 	return FillsForTx(fills, txHash)
+}
+
+// FillsClosingPosition are later prints of about the same size that are not the entry.
+func FillsClosingPosition(fills []Fill, entryClient int64, entryHash string, qty, afterUnix float64) []Fill {
+	var out []Fill
+	tol := math.Max(qty*0.15, 1e-8)
+	for _, f := range fills {
+		if entryClient != 0 && (f.AskClient == entryClient || f.BidClient == entryClient) {
+			continue
+		}
+		if entryHash != "" && sameTxHash(f.TxHash, entryHash) {
+			continue
+		}
+		if afterUnix > 0 {
+			if u := tradeUnix(f.Timestamp); u > 0 && u < afterUnix-0.5 {
+				continue
+			}
+		}
+		if qty > 0 && (f.Size+1e-12 < qty-tol || f.Size > qty+tol) {
+			continue
+		}
+		if f.Price <= 0 || f.Size <= 0 {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 func normTxHash(h string) string {

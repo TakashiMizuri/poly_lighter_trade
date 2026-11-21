@@ -156,6 +156,7 @@ function skipLabel(reason: string) {
     flatten_busy: "не flat",
     order_failed: "ордер не ушёл",
     entry_unfilled_after_send: "ордер без fill",
+    closed_away: "закрыто не стопом",
     stop_missing: "стоп не встал",
     equity: "нет equity",
     no_px: "нет цены BTC",

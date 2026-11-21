@@ -28,3 +28,15 @@ func TestSameTxHash(t *testing.T) {
 		t.Fatal("empty")
 	}
 }
+
+func TestFillsClosingPositionSkipsEntry(t *testing.T) {
+	fills := []Fill{
+		{Price: 56125, Size: 0.00044, Timestamp: 1_000, TxHash: "entryhash", AskClient: 10},
+		{Price: 56165.7, Size: 0.00044, Timestamp: 1_011, TxHash: "closehash", BidClient: 11},
+	}
+	got := FillsClosingPosition(fills, 10, "entryhash", 0.00044, 1_000)
+	px, qty, _, _ := VWAP(got)
+	if qty != 0.00044 || px != 56165.7 {
+		t.Fatalf("close px=%v qty=%v n=%d", px, qty, len(got))
+	}
+}
