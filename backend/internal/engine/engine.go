@@ -623,13 +623,20 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	e.traceOpenTo("send_ack", sendAckAt)
 	w.State = "sent"
 	e.saveWindow(ctx, w)
-	_ = e.Store.InsertOrder(ctx, ts, "entry", errString(err, "sent"), clientIdx, hashOf(res), qty, px, nil)
+	txHash := hashOf(res)
+	_ = e.Store.InsertOrder(ctx, ts, "entry", errString(err, "sent"), clientIdx, txHash, qty, px, nil)
 	if err != nil {
-		return e.finishSkip(ctx, w, "order_failed", err.Error())
+		// Timeout/reset after the POST left the process is not a clean reject:
+		// reconcile via fills/position instead of treating it as "order never sent".
+		if !lighter.IsAmbiguousSubmit(err) {
+			return e.finishSkip(ctx, w, "order_failed", err.Error())
+		}
+		e.Log.Warn("entry send ambiguous; reconciling", "err", err, "client_idx", clientIdx)
+		e.alert(ctx, "warn", "entry_send_ambiguous", fmt.Sprintf("ack lost (%v); reconciling by client_idx=%d", err, clientIdx))
 	}
 
 	tFill := time.Now()
-	fillPx, fillQty, fee, fillUnix, oversize := e.confirmLiveFill(ctx, meta, clientIdx, hashOf(res), qty, px)
+	fillPx, fillQty, fee, fillUnix, oversize := e.confirmLiveFill(ctx, meta, clientIdx, txHash, qty, px)
 	e.traceDur("fill_wait", tFill)
 	if oversize != nil {
 		_ = e.ensureFlat(ctx, "unexpected_entry_size")
@@ -720,7 +727,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		WindowTS: ts, Side: side, Qty: usedQty, Notional: usedQty * fillPx,
 		EntryPx: fillPx, EntryTS: fillTS, EquityBefore: eq, ClientIdx: clientIdx, Fees: fee,
 		StopClientIdx: stopIdx, StopHash: stopHash, StopPx: stopPx,
-		FillLagMS: fillLag.Float64, ArmedAt: time.Now(), EntryHash: hashOf(res),
+		FillLagMS: fillLag.Float64, ArmedAt: time.Now(), EntryHash: txHash,
 	}
 	e.mu.Unlock()
 	entryTS := fillTS
