@@ -200,8 +200,8 @@ func (e *Engine) tick(ctx context.Context) error {
 		// A native reduce-only stop may have closed the position while this
 		// process was asleep. Detect that before waiting for the window close.
 		if !e.Cfg.DryRun && e.Signer != nil {
-			flat, _ := e.isFlat(ctx)
-			if flat {
+			flat, _, err := e.isFlat(ctx)
+			if err == nil && flat {
 				return e.flattenWindow(ctx, pos, "stop")
 			}
 		}
@@ -586,46 +586,14 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "order_failed", err.Error())
 	}
 
-	type positionResult struct {
-		position lighter.Position
-		open     bool
-		err      error
-	}
-	posCtx, posCancel := context.WithTimeout(ctx, 350*time.Millisecond)
-	posCh := make(chan positionResult, 1)
-	go func() {
-		acc, err := e.HTTP.AccountUrgent(posCtx, e.Cfg.AccountIndex)
-		if err != nil {
-			posCh <- positionResult{err: err}
-			return
-		}
-		p, open := acc.Position(e.Cfg.Symbol, meta.MarketID)
-		posCh <- positionResult{position: p, open: open}
-	}()
 	tFill := time.Now()
-	fillPx, fillQty, fee, fillUnix := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, px, 300*time.Millisecond)
+	fillPx, fillQty, fee, fillUnix, oversize := e.confirmLiveFill(ctx, meta, clientIdx, hashOf(res), qty, px)
 	e.traceDur("fill_wait", tFill)
-	tPos := time.Now()
-	select {
-	case pr := <-posCh:
-		if pr.err == nil && pr.open && pr.position.Size > 0 {
-			if pr.position.Size > qty+math.Pow10(-meta.SizeDecimals) {
-				posCancel()
-				_ = e.ensureFlat(ctx, "unexpected_entry_size")
-				e.halt(ctx, "unexpected_entry_size")
-				return e.finishSkip(ctx, w, "unexpected_entry_size", fmt.Sprintf("position %.8f exceeded requested %.8f", pr.position.Size, qty))
-			}
-			if fillQty <= 0 || pr.position.Size > fillQty {
-				fillQty = pr.position.Size
-			}
-			if pr.position.AvgEntry > 0 {
-				fillPx = pr.position.AvgEntry
-			}
-		}
-	case <-posCtx.Done():
+	if oversize != nil {
+		_ = e.ensureFlat(ctx, "unexpected_entry_size")
+		e.halt(ctx, "unexpected_entry_size")
+		return e.finishSkip(ctx, w, "unexpected_entry_size", oversize.Error())
 	}
-	posCancel()
-	e.traceDur("pos_check", tPos)
 	if fillPx <= 0 {
 		fillPx = px
 	}
@@ -776,7 +744,7 @@ func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string)
 	deadline := time.Unix(pos.WindowTS, 0).UTC().Add(300 * time.Second)
 	px, fee := 0.0, 0.0
 	if reason == "stop" {
-		px, qty, stopFee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, e.Markets[e.Cfg.Symbol].MarketID, pos.StopClientIdx, 0, 600*time.Millisecond)
+		px, qty, stopFee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, e.Markets[e.Cfg.Symbol].MarketID, pos.StopClientIdx, "", 0, 1500*time.Millisecond)
 		fee = stopFee
 		if px > 0 && qty > 0 {
 			_ = e.Store.InsertOrder(ctx, pos.WindowTS, "stop_loss_fill", "filled", pos.StopClientIdx, "", qty, px, map[string]any{"stop_px": pos.StopPx, "sl_slip_bps": strategy.SLSlipBps(pos.EntryPx, px, pos.Side, e.Cfg.StopPricePct)})
@@ -801,15 +769,15 @@ func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string)
 		retryUntil = e.now().Add(2 * time.Second)
 	}
 	for e.now().Before(retryUntil) {
-		flat, _ := e.isFlat(ctx)
-		if flat {
+		flat, _, err := e.isFlat(ctx)
+		if err == nil && flat {
 			break
 		}
 		late = e.now().After(deadline)
 		_, _, _ = e.marketClose(ctx, pos)
 		time.Sleep(200 * time.Millisecond)
 	}
-	if flat, _ := e.isFlat(ctx); !flat {
+	if flat, _, err := e.isFlat(ctx); err != nil || !flat {
 		late = true
 		e.alert(ctx, "error", "exit_late", "не удалось закрыть к границе")
 	}
@@ -894,7 +862,7 @@ func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64
 		return 0, 0, err
 	}
 	meta := e.Markets[e.Cfg.Symbol]
-	fillPx, _, fillFee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, idx, ref, 800*time.Millisecond)
+	fillPx, _, fillFee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, idx, hashOf(res), ref, 1500*time.Millisecond)
 	if fillPx <= 0 {
 		fillPx = ref
 	}
@@ -908,10 +876,15 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 		e.mu.Unlock()
 		return nil
 	}
-	flat, pos := e.isFlat(ctx)
-	if flat {
-		// Clear stale conditional orders once on boot, including the case where
-		// the previous process exited after the position was already closed.
+	wait := time.Duration(0)
+	if why == "entry_unfilled" {
+		wait = 6 * time.Second
+	}
+	pos, err := e.waitOpenPosition(ctx, wait)
+	if err != nil {
+		return err
+	}
+	if pos.Size <= 0 {
 		if why == "boot" || why == "kill" {
 			if err := e.Signer.CancelAll(ctx); err != nil {
 				e.Log.Warn("cancel stale orders on boot", "err", err)
@@ -925,46 +898,143 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 		live.Side = strategy.SideShort
 	}
 	for i := 0; i < 15; i++ {
+		if live.Qty <= 0 {
+			break
+		}
 		_, _, err := e.marketClose(ctx, live)
 		if err != nil {
 			e.Log.Warn("flatten retry", "err", err)
 		}
 		time.Sleep(200 * time.Millisecond)
-		if ok, _ := e.isFlat(ctx); ok {
+		flat, cur, ferr := e.isFlat(ctx)
+		if ferr != nil {
+			continue
+		}
+		if flat {
 			if err := e.Signer.CancelAll(ctx); err != nil {
 				e.Log.Warn("cancel residual orders after flatten", "why", why, "err", err)
 			}
 			return nil
 		}
+		if cur.Size > 0 {
+			live.Qty = cur.Size
+			if cur.Sign < 0 {
+				live.Side = strategy.SideShort
+			} else {
+				live.Side = strategy.SideLong
+			}
+		}
 	}
 	return fmt.Errorf("still not flat after flatten (%s)", why)
+}
+
+func (e *Engine) waitOpenPosition(ctx context.Context, wait time.Duration) (lighter.Position, error) {
+	deadline := time.Now().Add(800 * time.Millisecond)
+	persistFlat := wait > 0
+	if persistFlat {
+		deadline = time.Now().Add(wait)
+	}
+	var lastErr error
+	sawFlat := false
+	for {
+		flat, pos, err := e.isFlat(ctx)
+		if err != nil {
+			lastErr = err
+		} else if !flat && pos.Size > 0 {
+			return pos, nil
+		} else {
+			lastErr = nil
+			sawFlat = true
+			if !persistFlat || !time.Now().Before(deadline) {
+				return lighter.Position{}, nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			if lastErr != nil && !sawFlat {
+				return lighter.Position{}, lastErr
+			}
+			return lighter.Position{}, nil
+		}
+		select {
+		case <-ctx.Done():
+			if lastErr != nil && !sawFlat {
+				return lighter.Position{}, lastErr
+			}
+			return lighter.Position{}, ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
 }
 
 func (e *Engine) mustBeFlat(ctx context.Context) error {
 	if e.Cfg.DryRun {
 		return nil
 	}
-	ok, _ := e.isFlat(ctx)
+	ok, _, err := e.isFlat(ctx)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return fmt.Errorf("position not flat")
 	}
 	return nil
 }
 
-func (e *Engine) isFlat(ctx context.Context) (bool, lighter.Position) {
+func (e *Engine) isFlat(ctx context.Context) (bool, lighter.Position, error) {
 	if e.HTTP == nil {
-		return true, lighter.Position{}
+		return true, lighter.Position{}, nil
 	}
-	acc, err := e.HTTP.Account(ctx, e.Cfg.AccountIndex)
+	acc, err := e.HTTP.AccountUrgent(ctx, e.Cfg.AccountIndex)
 	if err != nil {
-		return false, lighter.Position{}
+		return false, lighter.Position{}, err
 	}
 	meta := e.Markets[e.Cfg.Symbol]
 	p, ok := acc.Position(e.Cfg.Symbol, meta.MarketID)
 	if !ok || p.Size == 0 {
-		return true, lighter.Position{}
+		return true, lighter.Position{}, nil
 	}
-	return false, p
+	return false, p, nil
+}
+
+const entryFillConfirm = 5 * time.Second
+
+func (e *Engine) confirmLiveFill(ctx context.Context, meta lighter.MarketMeta, clientIdx int64, txHash string, wantQty, fallbackPx float64) (px, qty, fee, unix float64, oversized error) {
+	px = fallbackPx
+	deadline := time.Now().Add(entryFillConfirm)
+	lot := math.Pow10(-meta.SizeDecimals)
+	for {
+		fills, err := e.HTTP.AccountTradesUrgent(ctx, e.Cfg.AccountIndex, meta.MarketID, 100)
+		if err == nil {
+			if p, q, f, u := lighter.VWAP(lighter.FillsMatching(fills, clientIdx, txHash)); q > 0 {
+				px, qty, fee, unix = p, q, f, u
+			}
+		}
+		acc, aerr := e.HTTP.AccountUrgent(ctx, e.Cfg.AccountIndex)
+		if aerr == nil {
+			if p, open := acc.Position(e.Cfg.Symbol, meta.MarketID); open && p.Size > 0 {
+				if p.Size > wantQty+lot {
+					return px, p.Size, fee, unix, fmt.Errorf("position %.8f exceeded requested %.8f", p.Size, wantQty)
+				}
+				if qty <= 0 || p.Size > qty {
+					qty = p.Size
+				}
+				if p.AvgEntry > 0 {
+					px = p.AvgEntry
+				}
+			}
+		}
+		if qty > 0 && px > 0 {
+			return px, qty, fee, unix, nil
+		}
+		if !time.Now().Before(deadline) {
+			return px, qty, fee, unix, nil
+		}
+		select {
+		case <-ctx.Done():
+			return px, qty, fee, unix, nil
+		case <-time.After(80 * time.Millisecond):
+		}
+	}
 }
 
 func (e *Engine) equity(ctx context.Context) (float64, error) {

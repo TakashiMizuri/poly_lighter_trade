@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -81,8 +82,8 @@ func (c *HTTPClient) accountTrades(ctx context.Context, accountIndex int64, mark
 			Fee:       takerFeeUSD(m),
 			Timestamp: int64(intField(m, "timestamp")),
 			TxHash:    strField(m, "tx_hash"),
-			AskClient: int64(intField(m, "ask_client_id", "ask_client_order_index", "ask_client_order_id", "client_order_index")),
-			BidClient: int64(intField(m, "bid_client_id", "bid_client_order_index", "bid_client_order_id")),
+			AskClient: int64(intField(m, "ask_client_id", "ask_client_id_str", "ask_client_order_index", "ask_client_order_id", "client_order_index")),
+			BidClient: int64(intField(m, "bid_client_id", "bid_client_id_str", "bid_client_order_index", "bid_client_order_id")),
 		})
 	}
 	return out, nil
@@ -123,6 +124,44 @@ func FillsForClient(fills []Fill, clientIdx int64) []Fill {
 		}
 	}
 	return out
+}
+
+func FillsForTx(fills []Fill, txHash string) []Fill {
+	want := normTxHash(txHash)
+	if want == "" {
+		return nil
+	}
+	var out []Fill
+	for _, f := range fills {
+		if sameTxHash(f.TxHash, want) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func FillsMatching(fills []Fill, clientIdx int64, txHash string) []Fill {
+	if subset := FillsForClient(fills, clientIdx); len(subset) > 0 {
+		return subset
+	}
+	return FillsForTx(fills, txHash)
+}
+
+func normTxHash(h string) string {
+	h = strings.TrimSpace(strings.ToLower(h))
+	h = strings.TrimPrefix(h, "0x")
+	return h
+}
+
+func sameTxHash(a, b string) bool {
+	na, nb := normTxHash(a), normTxHash(b)
+	if na == "" || nb == "" {
+		return false
+	}
+	if na == nb {
+		return true
+	}
+	return strings.HasPrefix(na, nb) || strings.HasPrefix(nb, na)
 }
 
 func tradeUnix(ts int64) float64 {
@@ -235,7 +274,7 @@ func (c *HTTPClient) OrderByClient(ctx context.Context, accountIndex, clientIdx 
 	return ExchangeOrder{}, fmt.Errorf("order %d not found", clientIdx)
 }
 
-func (c *HTTPClient) WaitFillFor(ctx context.Context, accountIndex int64, marketID uint16, clientIdx int64, fallback float64, budget time.Duration) (px, qty, fee, fillUnix float64) {
+func (c *HTTPClient) WaitFillFor(ctx context.Context, accountIndex int64, marketID uint16, clientIdx int64, txHash string, fallback float64, budget time.Duration) (px, qty, fee, fillUnix float64) {
 	if budget <= 0 {
 		budget = 800 * time.Millisecond
 	}
@@ -245,7 +284,7 @@ func (c *HTTPClient) WaitFillFor(ctx context.Context, accountIndex int64, market
 	for {
 		fills, err := c.AccountTradesUrgent(fillCtx, accountIndex, marketID, 100)
 		if err == nil {
-			subset := FillsForClient(fills, clientIdx)
+			subset := FillsMatching(fills, clientIdx, txHash)
 			if p, q, f, u := VWAP(subset); p > 0 {
 				return p, q, f, u
 			}
