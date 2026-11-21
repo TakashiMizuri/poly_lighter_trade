@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -113,12 +114,30 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 	if reason == "stop" && px > 0 {
 		_ = e.Store.InsertOrder(ctx, pos.WindowTS, "stop_loss_fill", "filled", pos.StopClientIdx, "", pos.Qty, px, map[string]any{"stop_px": pos.StopPx, "sl_slip_bps": strategy.SLSlipBps(pos.EntryPx, px, pos.Side, e.Cfg.StopPricePct)})
 	}
+	// Never book the IOC ref / entry as a "fill" — resolve by exit client_idx first.
+	// On the window boundary this must not block: next decide has only T+2s.
+	px, fee = e.ensureExitPx(ctx, pos, px, fee, nextSoon)
+	if px <= 0 && !nextSoon {
+		if mark, err := e.btcPx(ctx); err == nil && mark > 0 {
+			e.Log.Warn("exit px unconfirmed; booking mark", "mark", mark, "entry", pos.EntryPx)
+			px = mark
+		}
+	}
 	if px <= 0 {
-		px, _ = e.btcPx(ctx)
+		// Provisional: entry is better than 0 for ready-state; refineExitAsync fixes PnL.
+		px = pos.EntryPx
 	}
 	eq := pos.EquityBefore
 	if !nextSoon {
 		if v, err := e.equity(ctx); err == nil && v > 0 {
+			eq = v
+		}
+	} else {
+		// Tiny budget only — a hung /api/v1/account must not skip the next window.
+		ectx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		v, err := e.equity(ectx)
+		cancel()
+		if err == nil && v > 0 {
 			eq = v
 		}
 	}
@@ -181,11 +200,37 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 	e.setState(StateIdle)
 	e.flogWindow("exit", w)
 	e.alert(ctx, "info", "exit", fmt.Sprintf("%s pnl=%.2f ret=%.2fbps eq=%.2f", pos.Side, pnl-fees, ret*1e4, eq))
-	if pos.ExitClientIdx != 0 && pos.ExitHash != "" {
+	if pos.ExitClientIdx != 0 {
 		e.refineExitAsync(pos, pos.ExitClientIdx, pos.ExitHash)
 	}
 	e.shadowAsync(pos.WindowTS)
 	return nil
+}
+
+// ensureExitPx replaces missing / suspicious exit prices (IOC ref often equals entry
+// when btcPx timed out) with the trades-tape fill for ExitClientIdx.
+// nextSoon: never wait — window_close must release the loop for decide(next) inside T+2.
+func (e *Engine) ensureExitPx(ctx context.Context, pos *livePos, px, fee float64, nextSoon bool) (float64, float64) {
+	if pos == nil || e.HTTP == nil || pos.ExitClientIdx == 0 {
+		return px, fee
+	}
+	if nextSoon {
+		return px, fee
+	}
+	suspicious := px <= 0 || (pos.EntryPx > 0 && math.Abs(px-pos.EntryPx) < 1e-6)
+	if !suspicious {
+		return px, fee
+	}
+	budget := 2 * time.Second
+	meta := e.Markets[e.Cfg.Symbol]
+	wctx, cancel := context.WithTimeout(context.Background(), budget)
+	p, q, f, _ := e.HTTP.WaitFillFor(wctx, e.Cfg.AccountIndex, meta.MarketID, pos.ExitClientIdx, pos.ExitHash, 0, budget)
+	cancel()
+	if q > 0 && p > 0 {
+		e.Log.Info("exit px resolved from tape", "px", p, "was", px, "client_idx", pos.ExitClientIdx)
+		return p, fee + f
+	}
+	return px, fee
 }
 
 type settleCloseMode int
@@ -296,9 +341,13 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 	pos.ExitClientIdx = idx
 	pos.ExitHash = txHash
 	meta := e.Markets[e.Cfg.Symbol]
+	// fillWait<=0 means boundary/urgent close: at most one trades poll. Burning
+	// 800ms here is what pushes decide(next) past T+2 after window_close.
 	confirmBudget := fillWait
+	boundaryFast := false
 	if confirmBudget <= 0 {
-		confirmBudget = 800 * time.Millisecond
+		confirmBudget = time.Millisecond
+		boundaryFast = true
 	}
 	wctx, cancel := context.WithTimeout(context.Background(), confirmBudget)
 	fill := e.HTTP.ConfirmFill(wctx, lighter.ConfirmFillOpts{
@@ -314,24 +363,26 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 	})
 	cancel()
 	if fill.Qty > 0 && fill.Px > 0 {
-		pos.ExitHash = ""
+		// Keep ExitClientIdx/Hash so refineExitAsync can still correct a bad VWAP.
 		return fill.Px, fill.Fee, nil
 	}
-	// Ambiguous or slow fill: if account is already flat, treat close as done.
-	if flat, _, ferr := e.isFlat(ctx); ferr == nil && flat {
-		return ref, 0, nil
+	// Close may already be done on the venue, but ref/FallbackPx is NOT a fill.
+	// Returning 0 forces ensureExitPx / refineExitAsync to book from trades tape.
+	if !boundaryFast {
+		if flat, _, ferr := e.isFlat(ctx); ferr == nil && flat {
+			e.Log.Warn("exit fill unconfirmed while flat; deferring px to tape", "client_idx", idx, "ref", ref)
+			return 0, 0, nil
+		}
 	}
 	if err != nil {
 		return 0, 0, fmt.Errorf("exit unconfirmed after ambiguous/failed send: %w", err)
 	}
-	if fillWait <= 0 {
-		return ref, 0, nil
-	}
-	return ref, 0, nil
+	e.Log.Warn("exit fill unconfirmed; deferring px to tape", "client_idx", idx, "ref", ref, "boundary_fast", boundaryFast)
+	return 0, 0, nil
 }
 
 func (e *Engine) refineExitAsync(pos *livePos, clientIdx int64, txHash string) {
-	if e.HTTP == nil || pos == nil || e.Store == nil {
+	if e.HTTP == nil || pos == nil || e.Store == nil || clientIdx == 0 {
 		return
 	}
 	windowTS := pos.WindowTS
@@ -341,14 +392,21 @@ func (e *Engine) refineExitAsync(pos *livePos, clientIdx int64, txHash string) {
 	entryFees := pos.Fees
 	meta := e.Markets[e.Cfg.Symbol]
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
-		px, qty, fee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, txHash, 0, 3500*time.Millisecond)
+		px, qty, fee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, txHash, 0, 7*time.Second)
 		if qty <= 0 || px <= 0 {
+			e.Log.Warn("refine exit: fill still missing", "client_idx", clientIdx, "window_ts", windowTS)
 			return
 		}
 		w, err := e.Store.GetWindow(ctx, windowTS)
 		if err != nil {
+			return
+		}
+		// Only overwrite when we improve on a missing/suspicious book (entry-as-exit).
+		if w.LighterExitPx.Valid && w.LighterExitPx.Float64 > 0 && entry > 0 &&
+			math.Abs(w.LighterExitPx.Float64-entry) >= 1e-6 &&
+			math.Abs(w.LighterExitPx.Float64-px) < 1e-6 {
 			return
 		}
 		w.LighterExitPx = sql.NullFloat64{Float64: px, Valid: true}
@@ -363,6 +421,7 @@ func (e *Engine) refineExitAsync(pos *livePos, clientIdx int64, txHash string) {
 			w.PnLUSD = sql.NullFloat64{Float64: notional*ret - fees, Valid: true}
 		}
 		_ = e.Store.UpdateWindow(ctx, w)
+		e.Log.Info("refine exit booked", "window_ts", windowTS, "px", px, "client_idx", clientIdx)
 	}()
 }
 

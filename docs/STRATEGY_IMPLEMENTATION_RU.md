@@ -291,7 +291,9 @@ Flatness **трёхзначная**: `flat` / `open` / `unknown` (сеть). О�
    - window/halt → CancelAll + market.
 4. `exit_late` + `bumpLateStreak` **только** если финальный poll = confirmed open. Unknown → alert `exit_flat_unknown`, streak не трогаем.
 5. PnL, `ExitReason`: `sl` | `closed_away` | `halt` | `window_close` | …
-6. `pos=nil`, shadow async, `waitNextOpen(next)`.
+6. `pos=nil`, shadow async, `waitNextOpen(next)` → `decide(next)`.
+
+**Инвариант границы:** `window_close` не должен съедать T+2 следующего окна. На `nextSoon` — cancel+IOC без длинного ConfirmFill/tape wait; exit px/equity дожимает `refineExitAsync`. Arm next — до `exitAt` (не отрезать за 2s).
 
 ---
 
@@ -470,6 +472,7 @@ main → Bootstrap → Run
 | README historically | one-liner без стопа | должен ссылаться на `_1_1` + этот файл |
 | Clock gate `_1` | skip если Binance offset &gt;1s | код: host UTC; Binance не блокирует вход (`_1_1`) |
 | Local stop watchdog | SLA &lt;200ms | exchange stop + `detectExit` + `resolveStopWatchdog` (poll flat → remote/residual/keep-stop); `exit_late` только на confirmed open |
+| window_close vs T+2 | flatten ≤300ms до :00 | sync path on boundary must not ConfirmFill 800ms / tape 1.5s; else next window `late` |
 | HALT 10 окон без стопа | в `_1_1` | заменено на immediate `stop_missing` |
 | Gamma synthetic book | CLOB канон | live gate: только WS/REST CLOB; Gamma mid не подставляет synthetic book |
 | Dry-run stop | risk model со стопом | paper path ставит `stop_loss` dry_run + `StopPx` в позиции |

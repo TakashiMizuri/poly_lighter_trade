@@ -113,7 +113,9 @@ func (e *Engine) tick(ctx context.Context) error {
 		nextTS := pos.WindowTS + clock.WindowSec
 		nextOpen := time.Unix(nextTS, 0).UTC()
 		prewarmNext := nextOpen.Add(-time.Duration(e.Cfg.PrewarmSeconds * float64(time.Second)))
-		if !now.Before(prewarmNext) && now.Before(exitAt.Add(-2*time.Second)) {
+		// Arm next until exitAt — do not stop 2s early; close still needs the loop,
+		// but a late arm retry beats arriving at waitNextOpen with no market.
+		if !now.Before(prewarmNext) && now.Before(exitAt) {
 			e.mu.Lock()
 			armedNext := e.armedFor == nextTS
 			e.mu.Unlock()

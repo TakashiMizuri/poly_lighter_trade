@@ -216,6 +216,24 @@ func TestResolveStopWatchdogRemoteFlat(t *testing.T) {
 	}
 }
 
+func TestEnsureExitPxSkipsWhenNotSuspicious(t *testing.T) {
+	e := New(testConfig(), nil, nil, nil, nil, nil, nil, nil, nil)
+	pos := &livePos{EntryPx: 60_000, ExitClientIdx: 1}
+	px, fee := e.ensureExitPx(context.Background(), pos, 60_250, 0.01, false)
+	if px != 60_250 || fee != 0.01 {
+		t.Fatalf("got %v %v", px, fee)
+	}
+}
+
+func TestEnsureExitPxNoHTTPLeavesSuspicious(t *testing.T) {
+	e := New(testConfig(), nil, nil, nil, nil, nil, nil, nil, nil)
+	pos := &livePos{EntryPx: 60_174.9, ExitClientIdx: 14}
+	px, fee := e.ensureExitPx(context.Background(), pos, 60_174.9, 0, true)
+	if px != 60_174.9 || fee != 0 {
+		t.Fatalf("without HTTP must leave px alone, got %v %v", px, fee)
+	}
+}
+
 func TestResolveStopWatchdogGrace(t *testing.T) {
 	cfg := testConfig()
 	e := New(cfg, nil, nil, nil, nil, nil, nil, nil, nil)
