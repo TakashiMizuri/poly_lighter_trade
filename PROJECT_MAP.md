@@ -3,7 +3,7 @@
 Краткая навигация для ИИ и людей. Детали стратегии — в `docs/`, деплой — в `INSTRUCTIONS.md`.  
 **Обновляй эту карту**, когда меняется структура, ответственность пакетов или критичные потоки.
 
-Последняя актуализация: 2026-11-21.
+Последняя актуализация: 2026-11-21 (engine split + STRATEGY_IMPLEMENTATION_RU).
 
 ---
 
@@ -29,7 +29,7 @@ poly_lighter_trade/
 ├── README.md                 # обзор продукта
 ├── INSTRUCTIONS.md           # VPS / deploy / диагностика
 ├── BOTS_CLOCK_AND_LAG_CONTEXT.md  # контекст часов/лага (два бота)
-├── docs/                     # контракт стратегии (startpack)
+├── docs/                     # startpack + STRATEGY_IMPLEMENTATION_RU.md
 ├── docker-compose.yml
 ├── .env.example
 ├── deploy/                   # Caddyfile (опционально, осторожно с Donchian)
@@ -86,7 +86,7 @@ main.go
 
 | Пакет | Ответственность | Ключевые файлы |
 |-------|-----------------|----------------|
-| `engine` | Оркестрация окна, позиции, halt/kill, timing traces | `engine.go`, `trace.go`, `snapshot.go` |
+| `engine` | Оркестрация окна, позиции, halt/kill, timing traces | `engine.go` (types), `lifecycle.go`, `entry.go`, `exit.go`, `risk.go`, `shadow.go`, `persist.go`, `trace.go`, `snapshot.go` |
 | `strategy` | Порог/спред → side; stop price; lot floor | `gate.go`, `stop.go` |
 | `exchange/lighter` | REST, SendTx, подпись ордеров, fills/tape, ambiguous submit | `http.go`, `signer.go`, `trades.go`, `ambiguous.go` |
 | `polymarket` | Событие/slug, book quotes | `client.go` |
@@ -137,7 +137,9 @@ main.go
 | `PROJECT_MAP.md` | Индекс структуры и ответственности |
 | `README.md` | Человеческий обзор |
 | `INSTRUCTIONS.md` | Deploy, wipe, снятие диагностики |
-| `docs/POLY_LIGHTER_STARTPACK_*.md` | Контракт стратегии / спека |
+| `docs/POLY_LIGHTER_STARTPACK_1_1.md` | Live-канон стратегии (со стопом) |
+| `docs/POLY_LIGHTER_STARTPACK_1.md` | Исторический hold-to-close без стопа |
+| `docs/STRATEGY_IMPLEMENTATION_RU.md` | Алгоритм и сценарии как в коде |
 | `BOTS_CLOCK_AND_LAG_CONTEXT.md` | Разбор часов/лага двух ботов (контекст) |
 
 ---

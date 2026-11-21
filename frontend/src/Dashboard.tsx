@@ -12,6 +12,7 @@ import {
   api,
   num,
 } from "./api";
+import { exitLabel, skipLabel } from "./labels";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -141,29 +142,6 @@ function TimingsView({ t, compact }: { t?: WindowTimings | null; compact?: boole
   );
 }
 
-function skipLabel(reason: string) {
-  const map: Record<string, string> = {
-    below_th: "ниже порога 0.65",
-    both_ge_th: "обе стороны ≥ 0.65",
-    late: "позже T+2 с",
-    clock: "часы хоста",
-    no_market: "нет рынка PM",
-    bad_quote: "нет живой котировки",
-    stale_quote: "котировка устарела",
-    quote_incoherent: "котировка Up/Down не сходится",
-    halt: "HALT",
-    equity_too_small: "мало equity / лот",
-    flatten_busy: "не flat",
-    order_failed: "ордер не ушёл",
-    entry_unfilled_after_send: "ордер без fill",
-    closed_away: "закрыто не стопом",
-    stop_missing: "стоп не встал",
-    equity: "нет equity",
-    no_px: "нет цены BTC",
-  };
-  return map[reason] || reason;
-}
-
 function sideBadge(side: string) {
   if (side === "long") return <Badge>LONG</Badge>;
   if (side === "short") return <Badge variant="outline">SHORT</Badge>;
@@ -215,9 +193,23 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
   }
 
   useEffect(() => {
-    void refresh();
-    const id = setInterval(() => void refresh(), 5000);
-    return () => clearInterval(id);
+    let cancelled = false;
+    let inFlight = false;
+    const tick = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        await refresh();
+      } finally {
+        inFlight = false;
+      }
+    };
+    void tick();
+    const id = setInterval(() => void tick(), 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
 
   async function kill() {
@@ -225,6 +217,8 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
     try {
       await api.kill();
       await refresh();
+    } catch (e) {
+      setErr(`Kill failed: ${String(e)}`);
     } finally {
       setBusy(false);
     }
@@ -234,6 +228,8 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
     try {
       await api.resume();
       await refresh();
+    } catch (e) {
+      setErr(`Resume failed: ${String(e)}`);
     } finally {
       setBusy(false);
     }
@@ -259,8 +255,9 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
     [trades],
   );
   const lastTrade = trades[0];
+  const th = status?.threshold ?? 0.65;
   const signal =
-    status && status.p_up >= 0.65 ? "вход LONG" : status && 1 - status.p_up >= 0.65 ? "вход SHORT" : "обычно skip";
+    status && status.p_up >= th ? "вход LONG" : status && 1 - status.p_up >= th ? "вход SHORT" : "обычно skip";
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-7xl flex-col">
@@ -331,10 +328,10 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                     Up {fmt(status.p_up, 3)} · Down {fmt(status.p_down, 3)}
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    {signal} · порог 0.65 · спред {fmt(status.spread, 3)} · {status.quote_source || "нет котировки"} · age{" "}
+                    {signal} · порог {fmt(th, 2)} · спред {fmt(status.spread, 3)} · {status.quote_source || "нет котировки"} · age{" "}
                     {fmt(status.quote_age_ms, 0)} ms
                   </p>
-                  <p className="text-xs text-muted-foreground">Последний skip: {status.last_skip ? skipLabel(status.last_skip) : "—"}</p>
+                  <p className="text-xs text-muted-foreground">Последний skip: {status.last_skip ? skipLabel(status.last_skip, th) : "—"}</p>
                 </CardContent>
               </Card>
               <Card>
@@ -431,7 +428,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                     <ul className="space-y-1 text-sm">
                       {skipMix.map(([k, n]) => (
                         <li key={k} className="flex justify-between gap-3">
-                          <span>{skipLabel(k)}</span>
+                          <span>{skipLabel(k, th)}</span>
                           <span className="text-muted-foreground">{n}</span>
                         </li>
                       ))}
@@ -466,7 +463,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                             <TimingsView t={w.timings} compact />
                           </TableCell>
                           <TableCell className={`text-xs ${pnlClass(num(w.pnl_usd))}`}>
-                            {isTrade(w) ? (num(w.pnl_usd) != null ? `$${fmt(num(w.pnl_usd), 2)}` : w.exit_reason || "open") : skipLabel(w.skip_reason)}
+                            {isTrade(w) ? (num(w.pnl_usd) != null ? `$${fmt(num(w.pnl_usd), 2)}` : exitLabel(w.exit_reason) || "open") : skipLabel(w.skip_reason, th)}
                           </TableCell>
                         </TableRow>
                       ))}
@@ -499,14 +496,14 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
               <Stat label="n с лагом" value={String(stats?.n_fill_lag ?? 0)} />
               <Stat label="WR / mean bps" value={`${fmt((stats?.wr ?? 0) * 100, 1)}% / ${fmt(stats?.mean_bps, 1)}`} />
             </div>
-            <WindowTable rows={trades} tradesOnly />
+            <WindowTable rows={trades} tradesOnly threshold={th} />
           </TabsContent>
 
           <TabsContent value="windows" className="p-4">
             <p className="mb-2 text-xs text-muted-foreground">
               Лаг только если ордер создан на бирже. Skip = «—». Колонка «этапы» — диагностика, это не лаг.
             </p>
-            <WindowTable rows={windows} />
+            <WindowTable rows={windows} threshold={th} />
           </TabsContent>
 
           <TabsContent value="exec" className="space-y-3 p-4">
@@ -620,7 +617,7 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
   );
 }
 
-function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boolean }) {
+function WindowTable({ rows, tradesOnly, threshold = 0.65 }: { rows: WindowRow[]; tradesOnly?: boolean; threshold?: number }) {
   if (rows.length === 0) {
     return <p className="text-sm text-muted-foreground">{tradesOnly ? "Сделок ещё нет" : "Окон ещё нет"}</p>;
   }
@@ -634,7 +631,7 @@ function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boo
                 <div className="min-w-0">
                   <div className="text-xs font-medium tabular-nums">{utc(w.window_ts)}</div>
                   <div className="mt-1 text-xs text-muted-foreground">
-                    {w.exit_reason || (w.skip_reason ? skipLabel(w.skip_reason) : "окно")}
+                    {w.exit_reason ? exitLabel(w.exit_reason) : w.skip_reason ? skipLabel(w.skip_reason, threshold) : "окно"}
                   </div>
                 </div>
                 {sideBadge(w.side)}
@@ -687,11 +684,11 @@ function WindowTable({ rows, tradesOnly }: { rows: WindowRow[]; tradesOnly?: boo
             <TableRow key={w.window_ts}>
               <TableCell className="whitespace-nowrap text-xs">{utc(w.window_ts)}</TableCell>
               <TableCell>{sideBadge(w.side)}</TableCell>
-              <TableCell className="text-xs">{w.exit_reason || "—"}</TableCell>
+              <TableCell className="text-xs">{w.exit_reason ? exitLabel(w.exit_reason) : "—"}</TableCell>
               <TableCell>{fmt(w.p_up, 3)}</TableCell>
               <TableCell>{fmt(w.spread, 3)}</TableCell>
               <TableCell className="text-xs">{w.quote_source || "—"}</TableCell>
-              {!tradesOnly ? <TableCell className="text-xs">{w.skip_reason ? skipLabel(w.skip_reason) : "—"}</TableCell> : null}
+              {!tradesOnly ? <TableCell className="text-xs">{w.skip_reason ? skipLabel(w.skip_reason, threshold) : "—"}</TableCell> : null}
               <TableCell>{ms(tradeLag(w))}</TableCell>
               <TableCell className="max-w-[22rem] min-w-[16rem] whitespace-normal">
                 <TimingsView t={w.timings} compact />

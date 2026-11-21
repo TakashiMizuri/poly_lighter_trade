@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"syscall"
 	"testing"
 )
 
@@ -22,6 +23,16 @@ func TestIsAmbiguousSubmit(t *testing.T) {
 		Net: "tcp",
 		Err: &net.DNSError{Err: "i/o timeout", Name: "mainnet.zklighter.elliot.ai", IsTimeout: true},
 	}
+	connReset := &net.OpError{
+		Op:  "read",
+		Net: "tcp",
+		Err: syscall.ECONNRESET,
+	}
+	brokenPipe := &net.OpError{
+		Op:  "write",
+		Net: "tcp",
+		Err: errors.New("write: broken pipe"),
+	}
 	cases := []struct {
 		name string
 		err  error
@@ -36,6 +47,11 @@ func TestIsAmbiguousSubmit(t *testing.T) {
 		{"url net timeout", &url.Error{Op: "Post", URL: "https://example", Err: timeoutErr{}}, true},
 		{"dns i/o timeout", dnsTimeout, true},
 		{"eof", io.EOF, true},
+		{"econnreset", syscall.ECONNRESET, true},
+		{"epipe", syscall.EPIPE, true},
+		{"op econnreset", connReset, true},
+		{"op broken pipe", brokenPipe, true},
+		{"url connection reset", &url.Error{Op: "Post", URL: "https://example", Err: errors.New("read: connection reset by peer")}, true},
 		{"business code", fmt.Errorf("sendTx code=400 msg=invalid"), false},
 		{"http status", fmt.Errorf("POST /api/v1/sendTx: HTTP 503: unavailable"), false},
 		{"sign", fmt.Errorf("qty scales to 0"), false},

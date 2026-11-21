@@ -43,7 +43,8 @@
 
 | Вопрос | Документ |
 |--------|----------|
-| Контракт стратегии v1 | `docs/POLY_LIGHTER_STARTPACK_1.md` (+ `_1_1` при необходимости) |
+| Контракт стратегии (live) | `docs/POLY_LIGHTER_STARTPACK_1_1.md` |
+| Алгоритм / сценарии как в коде | `docs/STRATEGY_IMPLEMENTATION_RU.md` |
 | Выкат / VPS / рядом с Donchian | `INSTRUCTIONS.md` |
 | Краткий обзор продукта | `README.md` |
 | Часы / лаг / два бота на VPS | `BOTS_CLOCK_AND_LAG_CONTEXT.md` (контекст, не source of truth кода) |

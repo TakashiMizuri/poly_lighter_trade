@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 )
 
 type Fill struct {
@@ -67,25 +66,11 @@ func (c *HTTPClient) accountTrades(ctx context.Context, accountIndex int64, mark
 	}
 	out := make([]Fill, 0, len(wrap.Trades))
 	for _, raw := range wrap.Trades {
-		var m map[string]any
-		if err := json.Unmarshal(raw, &m); err != nil {
-			continue
-		}
-		mid, ok := asMarketID(intField(m, "market_id"))
+		f, ok := parseTradeRaw(raw)
 		if !ok {
 			continue
 		}
-		out = append(out, Fill{
-			MarketID:  mid,
-			Price:     floatField(m, "price"),
-			Size:      floatField(m, "size"),
-			USD:       floatField(m, "usd_amount"),
-			Fee:       takerFeeUSD(m),
-			Timestamp: int64(intField(m, "timestamp")),
-			TxHash:    strField(m, "tx_hash"),
-			AskClient: int64(intField(m, "ask_client_id", "ask_client_id_str", "ask_client_order_index", "ask_client_order_id", "client_order_index")),
-			BidClient: int64(intField(m, "bid_client_id", "bid_client_id_str", "bid_client_order_index", "bid_client_order_id")),
-		})
+		out = append(out, f)
 	}
 	return out, nil
 }
@@ -302,35 +287,3 @@ func (c *HTTPClient) OrderByClient(ctx context.Context, accountIndex, clientIdx 
 	return ExchangeOrder{}, fmt.Errorf("order %d not found", clientIdx)
 }
 
-func (c *HTTPClient) WaitFillFor(ctx context.Context, accountIndex int64, marketID uint16, clientIdx int64, txHash string, fallback float64, budget time.Duration) (px, qty, fee, fillUnix float64) {
-	if budget <= 0 {
-		budget = 800 * time.Millisecond
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	fillCtx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	deadline := time.Now().Add(budget)
-	const minGET = 400 * time.Millisecond
-	for {
-		if time.Until(deadline) < minGET {
-			return fallback, 0, 0, 0
-		}
-		fills, err := c.AccountTradesUrgent(fillCtx, accountIndex, marketID, 100)
-		if err == nil {
-			subset := FillsMatching(fills, clientIdx, txHash)
-			if p, q, f, u := VWAP(subset); p > 0 {
-				return p, q, f, u
-			}
-		}
-		if time.Now().After(deadline) {
-			return fallback, 0, 0, 0
-		}
-		select {
-		case <-fillCtx.Done():
-			return fallback, 0, 0, 0
-		case <-time.After(80 * time.Millisecond):
-		}
-	}
-}

@@ -6,6 +6,42 @@ import (
 	"testing"
 )
 
+func TestSaveGlobalCAS(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	st0 := GlobalState{ClientOrderSeq: 10, Version: 1}
+	ok, err := st.SaveGlobalCAS(ctx, st0, 0)
+	if err != nil || !ok {
+		t.Fatalf("initial cas ok=%v err=%v", ok, err)
+	}
+	st1 := GlobalState{ClientOrderSeq: 11, Version: 2}
+	ok, err = st.SaveGlobalCAS(ctx, st1, 1)
+	if err != nil || !ok {
+		t.Fatalf("cas v1 ok=%v err=%v", ok, err)
+	}
+	stStale := GlobalState{ClientOrderSeq: 99, Version: 2}
+	ok, err = st.SaveGlobalCAS(ctx, stStale, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("stale cas should fail")
+	}
+	loaded, err := st.LoadGlobal(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ClientOrderSeq != 11 || loaded.Version != 2 {
+		t.Fatalf("loaded %+v", loaded)
+	}
+}
+
 func TestUniqueWindowTS(t *testing.T) {
 	dir := t.TempDir()
 	st, err := Open(filepath.Join(dir, "bot.db"))

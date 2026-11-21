@@ -16,6 +16,9 @@ func TestStrategyProfileDefaultsAllowed(t *testing.T) {
 	t.Setenv("LIGHTER_API_KEY_INDEX", "4")
 	t.Setenv("LIGHTER_NETWORK", "mainnet")
 	t.Setenv("LIGHTER_LEVERAGE", "1")
+	t.Setenv("DRY_RUN", "true")
+	t.Setenv("LIGHTER_API_PRIVATE_KEY", "")
+	t.Setenv("LIGHTER_ACCOUNT_INDEX", "0")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +33,21 @@ func TestStrategyProfileRejectsLeverageOverride(t *testing.T) {
 	t.Setenv("LIGHTER_API_KEY_INDEX", "4")
 	t.Setenv("LIGHTER_NETWORK", "mainnet")
 	t.Setenv("LIGHTER_LEVERAGE", "3")
+	t.Setenv("DRY_RUN", "true")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected reject")
+	}
+}
+
+func TestLiveRequiresAccountAndKey(t *testing.T) {
+	t.Setenv("DASHBOARD_PASSWORD", "x")
+	t.Setenv("LIGHTER_API_KEY_INDEX", "4")
+	t.Setenv("LIGHTER_NETWORK", "mainnet")
+	t.Setenv("LIGHTER_LEVERAGE", "1")
+	t.Setenv("DRY_RUN", "false")
+	t.Setenv("LIGHTER_API_PRIVATE_KEY", "")
+	t.Setenv("LIGHTER_ACCOUNT_INDEX", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected reject without key/account")
 	}
 }

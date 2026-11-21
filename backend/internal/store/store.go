@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -42,8 +43,14 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.DB.Close() }
 
+const schemaVersion = 2
+
 func (s *Store) migrate() error {
 	_, err := s.DB.Exec(`
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS windows (
   window_ts INTEGER PRIMARY KEY,
   decision_ts REAL,
@@ -109,17 +116,44 @@ CREATE TABLE IF NOT EXISTS bot_state (
 	if err != nil {
 		return err
 	}
-	for _, q := range []string{
-		`ALTER TABLE windows ADD COLUMN stop_px REAL`,
-		`ALTER TABLE windows ADD COLUMN exit_reason TEXT`,
-		`ALTER TABLE windows ADD COLUMN sl_slip_bps REAL`,
-		`ALTER TABLE windows ADD COLUMN clock_offset_ms REAL`,
-		`ALTER TABLE windows ADD COLUMN clock_rtt_ms REAL`,
-		`ALTER TABLE windows ADD COLUMN timings TEXT`,
-	} {
-		_, _ = s.DB.Exec(q)
+	var ver int
+	_ = s.DB.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&ver)
+	if ver < 1 {
+		for _, q := range []string{
+			`ALTER TABLE windows ADD COLUMN stop_px REAL`,
+			`ALTER TABLE windows ADD COLUMN exit_reason TEXT`,
+			`ALTER TABLE windows ADD COLUMN sl_slip_bps REAL`,
+			`ALTER TABLE windows ADD COLUMN clock_offset_ms REAL`,
+			`ALTER TABLE windows ADD COLUMN clock_rtt_ms REAL`,
+			`ALTER TABLE windows ADD COLUMN timings TEXT`,
+		} {
+			if _, err := s.DB.Exec(q); err != nil && !isSQLiteDuplicateColumn(err) {
+				return fmt.Errorf("migrate v1: %w", err)
+			}
+		}
+		if _, err := s.DB.Exec(`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?)`, time.Now().Unix()); err != nil {
+			return err
+		}
+		ver = 1
 	}
+	if ver < 2 {
+		if _, err := s.DB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS orders_client_order_index_uq ON orders(client_order_index) WHERE client_order_index IS NOT NULL AND client_order_index != 0`); err != nil {
+			return fmt.Errorf("migrate v2 unique client_order_index: %w", err)
+		}
+		if _, err := s.DB.Exec(`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, ?)`, time.Now().Unix()); err != nil {
+			return err
+		}
+	}
+	_ = schemaVersion
 	return nil
+}
+
+func isSQLiteDuplicateColumn(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exists")
 }
 
 type Window struct {
@@ -440,6 +474,8 @@ type GlobalState struct {
 	ClientOrderSeq int64   `json:"client_order_seq"`
 	LastError      string  `json:"last_error"`
 	GoLiveTS       int64   `json:"go_live_ts"`
+	// Version is a monotonic CAS token for bot_state last-write-wins protection.
+	Version int64 `json:"version"`
 }
 
 func (s *Store) LoadGlobal(ctx context.Context) (GlobalState, error) {
@@ -468,6 +504,53 @@ INSERT INTO bot_state(key, value, updated_at) VALUES(?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
 		"global", string(b), time.Now().Unix())
 	return err
+}
+
+// SaveGlobalCAS writes st only when the persisted Version equals expectedVersion.
+// On success st.Version must already be expectedVersion+1 (caller increments).
+func (s *Store) SaveGlobalCAS(ctx context.Context, st GlobalState, expectedVersion int64) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var raw string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM bot_state WHERE key = ?`, "global").Scan(&raw)
+	cur := GlobalState{}
+	switch {
+	case err == sql.ErrNoRows:
+		if expectedVersion != 0 {
+			return false, nil
+		}
+	case err != nil:
+		return false, err
+	default:
+		if err := json.Unmarshal([]byte(raw), &cur); err != nil {
+			return false, err
+		}
+		if cur.Version != expectedVersion {
+			return false, nil
+		}
+	}
+	if st.Version != expectedVersion+1 {
+		st.Version = expectedVersion + 1
+	}
+	b, err := json.Marshal(st)
+	if err != nil {
+		return false, err
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO bot_state(key, value, updated_at) VALUES(?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		"global", string(b), time.Now().Unix())
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type Stats struct {

@@ -1,9 +1,11 @@
 # POLY_LIGHTER_1 — автоторговый бот
 
-Контракт стратегии: [`docs/POLY_LIGHTER_STARTPACK_1.md`](docs/POLY_LIGHTER_STARTPACK_1.md).  
+Канон стратегии (live, со стопом): [`docs/POLY_LIGHTER_STARTPACK_1_1.md`](docs/POLY_LIGHTER_STARTPACK_1_1.md).  
+Как бот работает сейчас (алгоритм, сценарии, код): [`docs/STRATEGY_IMPLEMENTATION_RU.md`](docs/STRATEGY_IMPLEMENTATION_RU.md).  
+Исторический пакет без стопа: [`docs/POLY_LIGHTER_STARTPACK_1.md`](docs/POLY_LIGHTER_STARTPACK_1.md).  
 Выкат на VPS рядом с Donchian: [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
 
-На **открытии** каждого BTC 5m Up/Down рынка Polymarket читаем mid Up. Если сторона ≥ **0.65** — открываем **Lighter BTC-perp в ту же сторону** на 100% equity, **1x**, держим до close окна, flatten. Если обе стороны < 0.65 — skip. Это **не** fade и **не** ставка на Polymarket.
+На **открытии** каждого BTC 5m Up/Down рынка Polymarket читаем mid Up. Если сторона ≥ **0.65** — открываем **Lighter BTC-perp в ту же сторону** на 100% equity, **1x**, ставим стоп **0.125% цены**, иначе держим до close окна и flatten. Если обе стороны < 0.65 — skip. Это **не** fade и **не** ставка на Polymarket.
 
 | Слой | Стек |
 |------|------|
@@ -52,8 +54,8 @@ UFW: кроме 80/443 Donchian — `sudo ufw allow 8081/tcp` (или тольк
 2. На `ts` берёт mid Up. Sanity: spread ≤ 5¢, BBO не стены 0.01/0.99, возраст котировки ≤ 1 с.
 3. `p_up ≥ 0.65` → LONG; `p_up ≤ 0.35` → SHORT; иначе skip.
 4. Hard deadline входа **T+2.0 с**. Рестарт в середине окна **не** входит.
-5. Сайз: `qty = equity / px`, leverage 1. Выход за 300 мс до границы, reduce-only.
-6. Стоп-кран: 3 окна подряд `exit_late` / unfilled; позиция > 6 мин; DD > 8% от пика.
+5. Сайз: `qty = equity / px`, leverage 1. После fill — reduce-only стоп 0.125% цены. Выход за 300 мс до границы, если стоп не сработал.
+6. Стоп-кран: 3 окна подряд `exit_late` / unfilled; позиция > 6 мин; DD > 8% от пика; `stop_missing` → flatten + HALT.
 
 Прод: **mainnet**, `DRY_RUN=false`. Небольшой депозит на отдельном счёте = полный стек 1x на малых деньгах. Подробности: [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
 
@@ -66,7 +68,7 @@ cp .env.example .env
 mkdir -p data
 ```
 
-Семантика имён — §14 startpack. `DASHBOARD_PASSWORD` обязателен.
+Семантика имён — startpack `_1_1` и `STRATEGY_IMPLEMENTATION_RU.md`. `DASHBOARD_PASSWORD` обязателен.
 
 Локально без Docker:
 

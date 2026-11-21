@@ -256,21 +256,11 @@ func (c *Client) SnapshotUp(ctx context.Context, mkt Market, now time.Time, maxA
 	}
 	q := strategy.Quote{TokenUp: mkt.TokenUp, TokenDown: mkt.TokenDown}
 	bid, ask, err := c.RESTBook(ctx, mkt.TokenUp)
-	if err == nil {
-		q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, time.Now(), "rest_clob"
-		return q, nil
-	}
-	mid, gerr := c.GammaMid(ctx, mkt.Slug)
-	if gerr != nil {
+	if err != nil {
+		// Live gate uses CLOB only. Gamma mid must not become a synthetic book.
 		return q, err
 	}
-	// Gamma fallback: synthetic tight book around mid so sanity can still fail wide walls.
-	q.BidUp, q.AskUp = mid-0.005, mid+0.005
-	if q.BidUp <= 0 {
-		q.BidUp = mid
-		q.AskUp = mid
-	}
-	q.Recv, q.Source = time.Now(), "gamma"
+	q.BidUp, q.AskUp, q.Recv, q.Source = bid, ask, time.Now(), "rest_clob"
 	return q, nil
 }
 

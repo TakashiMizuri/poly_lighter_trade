@@ -173,7 +173,44 @@ func Load() (*Config, error) {
 	if !finite(cfg.PrewarmSeconds) || cfg.PrewarmSeconds < 15 || cfg.PrewarmSeconds > 120 {
 		return nil, fmt.Errorf("PM_PREWARM_SECONDS must be in [15, 120] for POLY_LIGHTER_1")
 	}
+	if !cfg.DryRun {
+		if strings.TrimSpace(cfg.APIPrivateKey) == "" {
+			return nil, fmt.Errorf("LIGHTER_API_PRIVATE_KEY is required unless DRY_RUN=true")
+		}
+		if cfg.AccountIndex <= 0 {
+			return nil, fmt.Errorf("LIGHTER_ACCOUNT_INDEX must be > 0 (separate account from other bots)")
+		}
+	}
+	if cfg.TelegramToken != "" && len(cfg.TelegramChatIDs) == 0 {
+		return nil, fmt.Errorf("TELEGRAM_CHAT_IDS is required when TELEGRAM_BOT_TOKEN is set")
+	}
+	if cfg.Network == NetworkMainnet && !cfg.CookieSecure {
+		fmt.Fprintf(os.Stderr, "warning: COOKIE_SECURE=false on mainnet; set true behind HTTPS reverse-proxy\n")
+	}
+	if err := requireParsedFloat("PM_THRESHOLD", cfg.Threshold); err != nil {
+		return nil, err
+	}
+	if err := requireParsedFloat("STOP_PRICE_PCT", cfg.StopPricePct); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+// requireParsedFloat rejects env values that were present but unparseable (silent default risk).
+func requireParsedFloat(key string, got float64) error {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	n, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fmt.Errorf("%s=%q is not a valid float", key, raw)
+	}
+	if !finite(n) {
+		return fmt.Errorf("%s=%q is not finite", key, raw)
+	}
+	_ = got
+	return nil
 }
 
 func (c *Config) SessionCookieName() string {
