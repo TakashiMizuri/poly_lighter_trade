@@ -28,6 +28,26 @@ func StopHit(last float64, side string, stopPx float64) bool {
 	}
 }
 
+// StopLikeFill is a stop fill even if Lighter prints a child market without our
+// stop client id. Last/mark can sit a couple of points on the safe side of the trigger.
+func StopLikeFill(px float64, side string, stopPx float64) bool {
+	if StopHit(px, side, stopPx) {
+		return true
+	}
+	if px <= 0 || stopPx <= 0 {
+		return false
+	}
+	band := stopPx * 0.0002 // 2 bps
+	switch side {
+	case SideLong:
+		return px <= stopPx+band
+	case SideShort:
+		return px >= stopPx-band
+	default:
+		return false
+	}
+}
+
 // SLSlipBps is how much worse the stop fill is than −pct of price (positive = worse).
 func SLSlipBps(entry, exit float64, side string, stopPct float64) float64 {
 	if entry <= 0 || exit <= 0 || stopPct <= 0 {

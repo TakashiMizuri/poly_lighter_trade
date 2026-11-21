@@ -24,6 +24,19 @@ func TestSLSlip(t *testing.T) {
 	}
 }
 
+func TestStopLikeFillChildMarket(t *testing.T) {
+	stop := 57_986.4
+	if !StopLikeFill(57_971.4, SideLong, stop) {
+		t.Fatal("through-stop fill")
+	}
+	if !StopLikeFill(57_989.4, SideLong, stop) {
+		t.Fatal("mark a few points above trigger still SL")
+	}
+	if StopLikeFill(58_059.0, SideLong, stop) {
+		t.Fatal("entry is not a stop")
+	}
+}
+
 func TestStopHit(t *testing.T) {
 	if !StopHit(99_870, SideLong, 99_875) {
 		t.Fatal("long")

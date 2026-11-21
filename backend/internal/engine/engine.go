@@ -40,6 +40,7 @@ type livePos struct {
 	EquityBefore  float64
 	ClientIdx     int64
 	StopClientIdx int64
+	StopHash      string
 	StopPx        float64
 	Fees          float64
 	FillLagMS     float64
@@ -288,33 +289,34 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 		}
 		e.traceDur("arm", tArm)
 	}
-	tReady := time.Now()
-	_ = e.refreshReady(ctx)
-	e.traceDur("ready", tReady)
-	// Stop doing synchronous account/price work well before :00. A slow REST
-	// refresh must never consume the entry budget at the boundary.
-	for e.now().Before(scheduleOpen.Add(-1200 * time.Millisecond)) {
-		rctx, cancel := context.WithDeadline(ctx, scheduleOpen.Add(-800*time.Millisecond))
+	// After a window close we often arrive past :00. Do not spend REST budget
+	// here — decide must still fit in T+2s. Ready state was set in settle.
+	if e.now().Before(scheduleOpen) {
+		tReady := time.Now()
+		rctx, cancel := context.WithDeadline(ctx, scheduleOpen.Add(-200*time.Millisecond))
 		_ = e.refreshReady(rctx)
 		cancel()
-		wake := e.now().Add(time.Second)
-		if wake.After(scheduleOpen.Add(-1200 * time.Millisecond)) {
-			wake = scheduleOpen.Add(-1200 * time.Millisecond)
+		e.traceDur("ready", tReady)
+		for e.now().Before(scheduleOpen.Add(-1200 * time.Millisecond)) {
+			rctx, cancel := context.WithDeadline(ctx, scheduleOpen.Add(-800*time.Millisecond))
+			_ = e.refreshReady(rctx)
+			cancel()
+			wake := e.now().Add(time.Second)
+			if wake.After(scheduleOpen.Add(-1200 * time.Millisecond)) {
+				wake = scheduleOpen.Add(-1200 * time.Millisecond)
+			}
+			if err := clock.SleepUntil(ctx, wake, e.now); err != nil {
+				return err
+			}
 		}
-		if err := clock.SleepUntil(ctx, wake, e.now); err != nil {
+		if err := clock.SleepUntil(ctx, scheduleOpen, e.now); err != nil {
 			return err
 		}
-	}
-	if err := clock.SleepUntil(ctx, scheduleOpen, e.now); err != nil {
-		return err
 	}
 	return e.decide(ctx, next)
 }
 
 func (e *Engine) refreshReady(ctx context.Context) error {
-	e.mu.Lock()
-	e.readyOK = false
-	e.mu.Unlock()
 	var eq float64
 	var flat bool
 	if e.HTTP != nil {
@@ -355,6 +357,21 @@ func (e *Engine) refreshReady(ctx context.Context) error {
 		return fmt.Errorf("unexpected position flattened during prewarm; entry disabled for this window")
 	}
 	return nil
+}
+
+func (e *Engine) markReadyAfterClose(px, eq float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if eq > 0 {
+		e.readyEq = eq
+	}
+	if px > 0 {
+		e.readyPx = px
+	}
+	if e.readyEq > 0 && e.readyPx > 0 {
+		e.readyAt = time.Now()
+		e.readyOK = true
+	}
 }
 
 func (e *Engine) arm(ctx context.Context, ts int64) error {
@@ -656,6 +673,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	var fillLag sql.NullFloat64
 	stopPx := strategy.StopPx(fillPx, side, e.Cfg.StopPricePct)
 	stopIdx := int64(0)
+	stopHash := ""
 	if stopPx > 0 {
 		stopIdx = e.nextClientIdx(ctx)
 		tStop := time.Now()
@@ -663,8 +681,9 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		stopResult, stopErr := e.Signer.StopLoss(sctx, e.Cfg.Symbol, side == strategy.SideLong, usedQty, stopPx, e.Cfg.MarketSlippage, stopIdx)
 		scancel()
 		e.traceDur("stop", tStop)
+		stopHash = hashOf(stopResult)
 		status := errString(stopErr, "sent")
-		_ = e.Store.InsertOrder(ctx, ts, "stop_loss", status, stopIdx, hashOf(stopResult), usedQty, stopPx, map[string]any{"trigger_price": stopPx, "reduce_only": true})
+		_ = e.Store.InsertOrder(ctx, ts, "stop_loss", status, stopIdx, stopHash, usedQty, stopPx, map[string]any{"trigger_price": stopPx, "reduce_only": true})
 		if stopErr != nil {
 			e.alert(ctx, "error", "stop_missing", fmt.Sprintf("не удалось поставить стоп %.2f после fill %.2f: %v; закрываю позицию", stopPx, fillPx, stopErr))
 			closeErr := e.ensureFlat(ctx, "stop_missing")
@@ -700,7 +719,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	e.pos = &livePos{
 		WindowTS: ts, Side: side, Qty: usedQty, Notional: usedQty * fillPx,
 		EntryPx: fillPx, EntryTS: fillTS, EquityBefore: eq, ClientIdx: clientIdx, Fees: fee,
-		StopClientIdx: stopIdx, StopPx: stopPx,
+		StopClientIdx: stopIdx, StopHash: stopHash, StopPx: stopPx,
 		FillLagMS: fillLag.Float64, ArmedAt: time.Now(), EntryHash: hashOf(res),
 	}
 	e.mu.Unlock()
@@ -770,11 +789,14 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 	e.setState(StateFlattening)
 	late := false
 	deadline := time.Unix(pos.WindowTS, 0).UTC().Add(300 * time.Second)
+	nextSoon := !e.now().Before(deadline.Add(-2 * time.Second))
 	alreadyFlat := false
-	if flat, _, err := e.isFlat(ctx); err == nil && flat {
-		alreadyFlat = true
+	if !nextSoon {
+		if flat, _, err := e.isFlat(ctx); err == nil && flat {
+			alreadyFlat = true
+		}
 	}
-	if px <= 0 {
+	if px <= 0 && !nextSoon {
 		if p, q, f, sl := e.closingTradeVWAP(ctx, pos); q > 0 {
 			px, fee = p, f
 			if reason == "" && sl {
@@ -785,6 +807,10 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 	if reason == "stop" && px > 0 {
 		_ = e.Store.InsertOrder(ctx, pos.WindowTS, "stop_loss_fill", "filled", pos.StopClientIdx, "", pos.Qty, px, map[string]any{"stop_px": pos.StopPx, "sl_slip_bps": strategy.SLSlipBps(pos.EntryPx, px, pos.Side, e.Cfg.StopPricePct)})
 	}
+	fillWait := 800 * time.Millisecond
+	if nextSoon {
+		fillWait = 0
+	}
 	if alreadyFlat {
 		if e.Signer != nil {
 			if err := e.Signer.CancelAll(ctx); err != nil {
@@ -793,7 +819,7 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 		}
 	} else if reason == "stop" || reason == "closed_away" {
 		e.Log.Warn("account still open after detected close, flattening", "reason", reason)
-		cpx, cfee, err := e.sendMarketClose(ctx, pos, 800*time.Millisecond)
+		cpx, cfee, err := e.sendMarketClose(ctx, pos, fillWait)
 		if err != nil {
 			e.alert(ctx, "error", "flatten", err.Error())
 		}
@@ -806,7 +832,7 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 				e.Log.Warn("cancel stop before window close", "err", err)
 			}
 		}
-		cpx, cfee, err := e.sendMarketClose(ctx, pos, 800*time.Millisecond)
+		cpx, cfee, err := e.sendMarketClose(ctx, pos, fillWait)
 		if err != nil {
 			e.alert(ctx, "error", "flatten", err.Error())
 		}
@@ -814,31 +840,36 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 			px, fee = cpx, cfee
 		}
 	}
-	retryUntil := e.now().Add(500 * time.Millisecond)
-	if retryUntil.After(deadline.Add(400 * time.Millisecond)) {
-		retryUntil = deadline.Add(400 * time.Millisecond)
-	}
-	for !alreadyFlat && e.now().Before(retryUntil) {
-		flat, _, err := e.isFlat(ctx)
-		if err == nil && flat {
-			break
+	if !nextSoon {
+		retryUntil := e.now().Add(500 * time.Millisecond)
+		for !alreadyFlat && e.now().Before(retryUntil) {
+			flat, _, err := e.isFlat(ctx)
+			if err == nil && flat {
+				break
+			}
+			late = e.now().After(deadline)
+			cpx, cfee, _ := e.sendMarketClose(ctx, pos, 0)
+			if cpx > 0 {
+				px = cpx
+				fee += cfee
+			}
+			time.Sleep(150 * time.Millisecond)
 		}
-		late = e.now().After(deadline)
-		cpx, cfee, _ := e.sendMarketClose(ctx, pos, 0)
-		if cpx > 0 {
-			px = cpx
-			fee += cfee
+		if flat, _, err := e.isFlat(ctx); err != nil || !flat {
+			late = true
+			e.alert(ctx, "error", "exit_late", "не удалось закрыть к границе")
 		}
-		time.Sleep(150 * time.Millisecond)
-	}
-	if flat, _, err := e.isFlat(ctx); err != nil || !flat {
-		late = true
-		e.alert(ctx, "error", "exit_late", "не удалось закрыть к границе")
 	}
 	if px <= 0 {
 		px, _ = e.btcPx(ctx)
 	}
-	eq, _ := e.equity(ctx)
+	eq := pos.EquityBefore
+	if !nextSoon {
+		if v, err := e.equity(ctx); err == nil && v > 0 {
+			eq = v
+		}
+	}
+	e.markReadyAfterClose(px, eq)
 	sign := strategy.Sign(pos.Side)
 	ret := 0.0
 	if pos.EntryPx > 0 && px > 0 {
@@ -913,9 +944,23 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 		px, err = e.btcPx(ctx)
 		return px, 0, err
 	}
-	ref, err := e.btcPx(ctx)
-	if err != nil {
-		return 0, 0, err
+	var ref float64
+	if fillWait <= 0 {
+		pctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		ref, err = e.btcPx(pctx)
+		cancel()
+		if err != nil || ref <= 0 {
+			ref = pos.EntryPx
+			err = nil
+		}
+		if ref <= 0 {
+			return 0, 0, fmt.Errorf("no ref price for close")
+		}
+	} else {
+		ref, err = e.btcPx(ctx)
+		if err != nil {
+			return 0, 0, err
+		}
 	}
 	buy := pos.Side == strategy.SideShort // closing short = buy
 	idx := e.nextClientIdx(ctx)
@@ -1103,16 +1148,38 @@ func (e *Engine) detectExit(ctx context.Context, pos *livePos) (reason string, p
 	if !pos.SeenAcctOpen {
 		return "", 0, 0, false
 	}
-	p, q, f, sl := e.closingTradeVWAP(ctx, pos)
+	// Trades REST often lags DNS/account. Do not book last/mark as the exit.
+	wait := 2500 * time.Millisecond
+	exitAt := time.Unix(pos.WindowTS, 0).UTC().Add(300*time.Second - e.Cfg.ExitEarly)
+	if remain := exitAt.Sub(e.now()); remain > 0 && remain < wait {
+		wait = remain
+	}
+	wctx, cancel := context.WithTimeout(context.Background(), wait)
+	p, q, f, sl := e.waitClosingVWAP(wctx, pos)
+	cancel()
 	if q > 0 {
 		px, fee = p, f
 	} else {
 		px, _ = e.btcPx(ctx)
 	}
-	if sl || (pos.StopPx > 0 && strategy.StopHit(px, pos.Side, pos.StopPx)) {
+	if sl || (pos.StopPx > 0 && strategy.StopLikeFill(px, pos.Side, pos.StopPx)) {
 		return "stop", px, fee, true
 	}
 	return "closed_away", px, fee, true
+}
+
+func (e *Engine) waitClosingVWAP(ctx context.Context, pos *livePos) (px, qty, fee float64, sl bool) {
+	for {
+		px, qty, fee, sl = e.closingTradeVWAP(ctx, pos)
+		if qty > 0 && px > 0 {
+			return px, qty, fee, sl
+		}
+		select {
+		case <-ctx.Done():
+			return 0, 0, 0, false
+		case <-time.After(120 * time.Millisecond):
+		}
+	}
 }
 
 func (e *Engine) closingTradeVWAP(ctx context.Context, pos *livePos) (px, qty, fee float64, sl bool) {
@@ -1124,8 +1191,8 @@ func (e *Engine) closingTradeVWAP(ctx context.Context, pos *livePos) (px, qty, f
 	if err != nil {
 		return 0, 0, 0, false
 	}
-	if pos.StopClientIdx != 0 {
-		if p, q, f, _ := lighter.VWAP(lighter.FillsMatching(fills, pos.StopClientIdx, "")); q > 0 {
+	if pos.StopClientIdx != 0 || pos.StopHash != "" {
+		if p, q, f, _ := lighter.VWAP(lighter.FillsMatching(fills, pos.StopClientIdx, pos.StopHash)); q > 0 {
 			return p, q, f, true
 		}
 	}
@@ -1134,6 +1201,9 @@ func (e *Engine) closingTradeVWAP(ctx context.Context, pos *livePos) (px, qty, f
 		after = float64(pos.ArmedAt.Unix())
 	}
 	p, q, f, _ := lighter.VWAP(lighter.FillsClosingPosition(fills, pos.ClientIdx, pos.EntryHash, pos.Qty, after))
+	if q > 0 && pos.StopPx > 0 && strategy.StopLikeFill(p, pos.Side, pos.StopPx) {
+		return p, q, f, true
+	}
 	return p, q, f, false
 }
 
