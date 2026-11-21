@@ -213,14 +213,11 @@ func (e *Engine) tick(ctx context.Context) error {
 		if now.After(exitAt) || now.Equal(exitAt) {
 			return e.settleWindow(ctx, pos, "", 0, 0)
 		}
-		if pos.StopPx > 0 {
-			pollAt := e.now().Add(200 * time.Millisecond)
-			if pollAt.After(exitAt) {
-				pollAt = exitAt
-			}
-			return clock.SleepUntil(ctx, pollAt, e.now)
+		pollAt := e.now().Add(time.Second)
+		if pollAt.After(exitAt) {
+			pollAt = exitAt
 		}
-		return clock.SleepUntil(ctx, exitAt, e.now)
+		return clock.SleepUntil(ctx, pollAt, e.now)
 	}
 
 	// Restart mid-window: never enter the boot window.
@@ -589,10 +586,8 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 
 	tFill := time.Now()
-	e.Log.Info("fill wait start", "ts", ts, "client_idx", clientIdx, "hash", hashOf(res), "want_qty", qty, "ref", px)
 	fillPx, fillQty, fee, fillUnix, oversize := e.confirmLiveFill(ctx, meta, clientIdx, hashOf(res), qty, px)
 	e.traceDur("fill_wait", tFill)
-	e.Log.Info("fill wait done", "ts", ts, "client_idx", clientIdx, "fill_px", fillPx, "fill_qty", fillQty, "fee", fee, "fill_unix", fillUnix, "ms", time.Since(tFill).Milliseconds(), "oversize", errString(oversize, ""))
 	if oversize != nil {
 		_ = e.ensureFlat(ctx, "unexpected_entry_size")
 		e.halt(ctx, "unexpected_entry_size")
@@ -662,13 +657,10 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	octx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	tOrd := time.Now()
 	if o, err := e.HTTP.OrderByClient(octx, e.Cfg.AccountIndex, clientIdx); err == nil {
-		e.Log.Info("entry order status", "ts", ts, "client_idx", clientIdx, "status", o.Status, "created_unix", o.CreatedUnix())
 		if u := o.CreatedUnix(); u > 0 {
 			fillLag = sql.NullFloat64{Float64: (u - float64(ts)) * 1000, Valid: true}
 			fillTS = u
 		}
-	} else {
-		e.Log.Info("entry order status", "ts", ts, "client_idx", clientIdx, "err", err.Error())
 	}
 	e.traceDur("order_get", tOrd)
 	cancel()
@@ -745,10 +737,6 @@ func (e *Engine) shadowAsync(ts int64) {
 	}()
 }
 
-func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string) error {
-	return e.settleWindow(ctx, pos, reason, 0, 0)
-}
-
 func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, px, fee float64) error {
 	e.setState(StateFlattening)
 	late := false
@@ -757,10 +745,12 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 	if flat, _, err := e.isFlat(ctx); err == nil && flat {
 		alreadyFlat = true
 	}
-	e.Log.Info("settle window", "window", pos.WindowTS, "reason", reason, "px", px, "fee", fee, "already_flat", alreadyFlat, "side", pos.Side, "qty", pos.Qty, "entry_px", pos.EntryPx, "stop_px", pos.StopPx, "stop_idx", pos.StopClientIdx)
 	if px <= 0 {
-		if p, q, f := e.closingTradeVWAP(ctx, pos); q > 0 {
+		if p, q, f, sl := e.closingTradeVWAP(ctx, pos); q > 0 {
 			px, fee = p, f
+			if reason == "" && sl {
+				reason = "stop"
+			}
 		}
 	}
 	if reason == "stop" && px > 0 {
@@ -893,7 +883,6 @@ func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64
 	}
 	buy := pos.Side == strategy.SideShort // closing short = buy
 	idx := e.nextClientIdx(ctx)
-	e.Log.Warn("market close send", "window", pos.WindowTS, "side", pos.Side, "qty", pos.Qty, "ref", ref, "idx", idx)
 	res, err := e.Signer.MarketIOC(ctx, e.Cfg.Symbol, buy, pos.Qty, ref, e.Cfg.MarketSlippage, idx, true)
 	_ = e.Store.InsertOrder(ctx, pos.WindowTS, "exit", errString(err, "sent"), idx, hashOf(res), pos.Qty, ref, nil)
 	if err != nil {
@@ -919,15 +908,10 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 		live := e.pos
 		e.mu.Unlock()
 		if live != nil {
-			e.Log.Warn("skip flatten, live position", "why", why, "window", live.WindowTS)
 			return nil
 		}
 	}
-	wait := time.Duration(0)
-	if why == "entry_unfilled" {
-		wait = 6 * time.Second
-	}
-	pos, err := e.waitOpenPosition(ctx, wait)
+	pos, err := e.waitOpenPosition(ctx)
 	if err != nil {
 		return err
 	}
@@ -975,14 +959,9 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 	return fmt.Errorf("still not flat after flatten (%s)", why)
 }
 
-func (e *Engine) waitOpenPosition(ctx context.Context, wait time.Duration) (lighter.Position, error) {
+func (e *Engine) waitOpenPosition(ctx context.Context) (lighter.Position, error) {
 	deadline := time.Now().Add(800 * time.Millisecond)
-	persistFlat := wait > 0
-	if persistFlat {
-		deadline = time.Now().Add(wait)
-	}
 	var lastErr error
-	sawFlat := false
 	for {
 		flat, pos, err := e.isFlat(ctx)
 		if err != nil {
@@ -990,41 +969,20 @@ func (e *Engine) waitOpenPosition(ctx context.Context, wait time.Duration) (ligh
 		} else if !flat && pos.Size > 0 {
 			return pos, nil
 		} else {
-			lastErr = nil
-			sawFlat = true
-			if !persistFlat || !time.Now().Before(deadline) {
-				return lighter.Position{}, nil
-			}
+			return lighter.Position{}, nil
 		}
 		if !time.Now().Before(deadline) {
-			if lastErr != nil && !sawFlat {
-				return lighter.Position{}, lastErr
-			}
-			return lighter.Position{}, nil
+			return lighter.Position{}, lastErr
 		}
 		select {
 		case <-ctx.Done():
-			if lastErr != nil && !sawFlat {
+			if lastErr != nil {
 				return lighter.Position{}, lastErr
 			}
 			return lighter.Position{}, ctx.Err()
 		case <-time.After(150 * time.Millisecond):
 		}
 	}
-}
-
-func (e *Engine) mustBeFlat(ctx context.Context) error {
-	if e.Cfg.DryRun {
-		return nil
-	}
-	ok, _, err := e.isFlat(ctx)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("position not flat")
-	}
-	return nil
 }
 
 func (e *Engine) isFlat(ctx context.Context) (bool, lighter.Position, error) {
@@ -1050,73 +1008,53 @@ func (e *Engine) detectExit(ctx context.Context, pos *livePos) (reason string, p
 	if !pos.ArmedAt.IsZero() && time.Since(pos.ArmedAt) < 5*time.Second {
 		return "", 0, 0, false
 	}
-	if p, q, f := e.closingTradeVWAP(ctx, pos); q > 0 {
-		e.Log.Info("detect exit fill", "window", pos.WindowTS, "px", p, "qty", q, "fee", f, "stop_px", pos.StopPx, "entry_px", pos.EntryPx)
-		reason = "closed_away"
-		last := p
-		if lp, err := e.btcPx(ctx); err == nil && lp > 0 {
-			last = lp
-		}
-		if pos.StopPx > 0 && (strategy.StopHit(p, pos.Side, pos.StopPx) || strategy.StopHit(last, pos.Side, pos.StopPx)) {
-			reason = "stop"
-		}
-		if pos.StopClientIdx != 0 {
-			meta := e.Markets[e.Cfg.Symbol]
-			if fills, err := e.HTTP.AccountTradesUrgent(ctx, e.Cfg.AccountIndex, meta.MarketID, 100); err == nil {
-				if _, sq, _, _ := lighter.VWAP(lighter.FillsMatching(fills, pos.StopClientIdx, "")); sq > 0 {
-					reason = "stop"
-				}
-			}
-		}
-		e.Log.Info("detect exit", "window", pos.WindowTS, "reason", reason, "px", p, "qty", q)
-		return reason, p, f, true
-	}
 	flat, _, err := e.isFlat(ctx)
 	if err != nil {
 		return "", 0, 0, false
 	}
 	if !flat {
 		e.mu.Lock()
-		first := e.pos != nil && !e.pos.SeenAcctOpen
 		if e.pos != nil {
 			e.pos.SeenAcctOpen = true
 		}
 		e.mu.Unlock()
-		if first {
-			e.Log.Info("account shows open", "window", pos.WindowTS, "side", pos.Side, "qty", pos.Qty)
-		}
 		return "", 0, 0, false
 	}
 	if !pos.SeenAcctOpen {
 		return "", 0, 0, false
 	}
-	last, _ := e.btcPx(ctx)
-	if pos.StopPx > 0 && strategy.StopHit(last, pos.Side, pos.StopPx) {
-		e.Log.Info("detect exit flat+stop", "window", pos.WindowTS, "last", last, "stop_px", pos.StopPx)
-		return "stop", last, 0, true
+	p, q, f, sl := e.closingTradeVWAP(ctx, pos)
+	if q > 0 {
+		px, fee = p, f
+	} else {
+		px, _ = e.btcPx(ctx)
 	}
-	e.Log.Info("detect exit flat", "window", pos.WindowTS, "last", last, "stop_px", pos.StopPx)
-	return "closed_away", last, 0, true
+	if sl || (pos.StopPx > 0 && strategy.StopHit(px, pos.Side, pos.StopPx)) {
+		return "stop", px, fee, true
+	}
+	return "closed_away", px, fee, true
 }
 
-func (e *Engine) closingTradeVWAP(ctx context.Context, pos *livePos) (px, qty, fee float64) {
+func (e *Engine) closingTradeVWAP(ctx context.Context, pos *livePos) (px, qty, fee float64, sl bool) {
 	if e.HTTP == nil || pos == nil {
-		return 0, 0, 0
+		return 0, 0, 0, false
 	}
 	meta := e.Markets[e.Cfg.Symbol]
 	fills, err := e.HTTP.AccountTradesUrgent(ctx, e.Cfg.AccountIndex, meta.MarketID, 100)
 	if err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, false
 	}
-	if p, q, f, _ := lighter.VWAP(lighter.FillsMatching(fills, pos.StopClientIdx, "")); q > 0 {
-		return p, q, f
+	if pos.StopClientIdx != 0 {
+		if p, q, f, _ := lighter.VWAP(lighter.FillsMatching(fills, pos.StopClientIdx, "")); q > 0 {
+			return p, q, f, true
+		}
 	}
 	after := pos.EntryTS
 	if after <= 0 && !pos.ArmedAt.IsZero() {
 		after = float64(pos.ArmedAt.Unix())
 	}
 	p, q, f, _ := lighter.VWAP(lighter.FillsClosingPosition(fills, pos.ClientIdx, pos.EntryHash, pos.Qty, after))
-	return p, q, f
+	return p, q, f, false
 }
 
 const entryFillConfirm = 5 * time.Second
@@ -1147,16 +1085,14 @@ func (e *Engine) confirmLiveFill(ctx context.Context, meta lighter.MarketMeta, c
 			}
 		}
 		if qty > 0 && px > 0 {
-			e.Log.Info("fill confirmed", "client_idx", clientIdx, "hash", txHash, "px", px, "qty", qty, "fee", fee, "unix", unix)
 			return px, qty, fee, unix, nil
 		}
 		if !time.Now().Before(deadline) {
-			e.Log.Info("fill not confirmed", "client_idx", clientIdx, "hash", txHash, "want_qty", wantQty, "trades_err", errString(err, ""), "acct_err", errString(aerr, ""))
+			e.Log.Warn("fill not confirmed", "client_idx", clientIdx, "hash", txHash, "want_qty", wantQty, "trades_err", errString(err, ""), "acct_err", errString(aerr, ""))
 			return px, qty, fee, unix, nil
 		}
 		select {
 		case <-ctx.Done():
-			e.Log.Info("fill wait canceled", "client_idx", clientIdx, "err", ctx.Err().Error())
 			return px, qty, fee, unix, nil
 		case <-time.After(80 * time.Millisecond):
 		}

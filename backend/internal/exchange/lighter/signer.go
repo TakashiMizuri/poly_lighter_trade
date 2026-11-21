@@ -90,7 +90,6 @@ func (s *Signer) PrepareNonce(ctx context.Context) error {
 		return err
 	}
 	s.nextNonce, s.nonceReady = n, true
-	s.audit("nonce ready", "nonce", n, "account", s.Tx.GetAccountIndex(), "api_key_index", s.Tx.GetApiKeyIndex())
 	return nil
 }
 

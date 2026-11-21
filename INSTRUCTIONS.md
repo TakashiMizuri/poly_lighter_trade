@@ -5,6 +5,8 @@
 
 Это **отдельный** Docker Compose, **отдельный** каталог, **отдельный** счёт Lighter, **отдельный** Telegram-бот, **отдельный** порт дашборда. Donchian (`/opt/donchian`) не останавливать и его `.env.a` не трогать.
 
+**Уже стоит на VPS и нужно подтянуть код + полный сброс БД/логов:** §11 (один блок на SSH). Не копировать `.env.example` поверх живого `.env`.
+
 | | Donchian | Этот бот |
 |--|--|--|
 | Каталог | `/opt/donchian` | `/opt/poly-lighter` |
@@ -369,44 +371,57 @@ poly.example.com {
 
 ---
 
-## 11. Обновление кода
+## 11. Pull + полный сброс + recreate (канон на VPS)
 
-Менял `.env` (включая `STOP_PRICE_PCT`) или образ → **`--force-recreate`**, не голый `restart`. Перед обновлением проверь, что в `.env` присутствует ненулевой `STOP_PRICE_PCT` (для старого файла добавь `STOP_PRICE_PCT=0.00125`). Если ты выставил `MARKET_SLIPPAGE=0.0005` по моей прежней инструкции, верни `MARKET_SLIPPAGE=0.02`: 5 bps были необоснованным ужесточением и могли мешать IOC-входу. Редактируй именно `.env`, сохраняя секреты; не копируй поверх него `.env.example`. Также проверь `PM_PREWARM_SECONDS=15` (допустимо 15–120).
-Бот отправляет защитный reduce-only стоп после подтверждения fill (trades по client id / tx hash **и** позиция, до ~5 с). Если REST отстаёт, это больше не помечается как `entry_unfilled` за 300 мс. Если отправка стопа не удалась, он пытается закрыть позицию и уходит в HALT. Это аварийная реакция, а не гарантия исполнения при отказе сети или биржи.
-`KILL_SWITCH=false` в файле ≠ в уже бегущем процессе: HALT живёт в SQLite. После **полного сброса `data/`** (ниже) HALT пропадает вместе с историей окон; `/resume` не нужен.
+Это **единственный** блок «перезапустить poly с нуля». Копируй его каждый раз. Donchian (`/opt/donchian`) не трогать.
 
-### Полный сброс данных + код + перезапуск (SSH)
+Стирает SQLite, WAL, логи приложения, docker-логи контейнеров poly. **Не** трогает `.env` и ключи. HALT живёт в SQLite — после wipe пропадает, `/resume` не нужен. `KILL_SWITCH=false` в файле ≠ в уже бегущем процессе.
 
-Стирает SQLite, WAL, логи приложения, docker-логи контейнеров. **Не** трогает `.env` и ключи. Перед запуском на Lighter UI: позиция **FLAT**, нет висящих ордеров, нет второго процесса/вкладки с тем же API-ключом. На старте бот всё равно попытается flatten.
+Перед блоком в Lighter UI на **аккаунте poly** (`LIGHTER_ACCOUNT_INDEX` из `/opt/poly-lighter/.env`): позиция **FLAT**, нет висящих ордеров. На старте бот всё равно попытается flatten.
 
-Вставь весь блок:
+На этом хосте **нельзя** второму процессу сидеть на том же аккаунте / `api_key_index`. `donchian-bot_b` вырезан из compose Donchian — если контейнер снова Up, он flatten'ит poly. `bot_a` Donchian — **другой** `LIGHTER_ACCOUNT_INDEX`.
+
+Менял `.env` или образ → всегда этот блок (`--force-recreate`), не голый `restart`. Не `cp .env.example .env`. `STOP_PRICE_PCT=0.00125`, `MARKET_SLIPPAGE=0.02`, `PM_PREWARM_SECONDS=15`.
+
+Вход подтверждается до ~5 с (trades + позиция). Если стоп после fill не встал — flatten и HALT.
+
+### Один блок (SSH, root, bash)
 
 ```bash
 cd /opt/poly-lighter || exit 1
 set -euo pipefail
 
-# 1) остановить бота (Donchian не трогаем)
+echo "poly account: $(grep '^LIGHTER_ACCOUNT_INDEX=' .env)"
+echo "donchian a:   $(grep '^LIGHTER_ACCOUNT_INDEX=' /opt/donchian/.env.a || true)"
+# числа ДОЛЖНЫ отличаться
+
+docker ps -a --format 'table {{.Names}}\t{{.Status}}'
+# donchian-bot_b-1 быть не должно. Если есть:
+#   docker stop donchian-bot_b-1 && docker rm -f donchian-bot_b-1
+#   cd /opt/donchian && docker compose rm -f bot_b 2>/dev/null || true
+#   cd /opt/poly-lighter
+
 docker compose down
 
-# 2) бэкап data + .env, затем полный wipe данных
 mkdir -p backups
 tar czf "backups/data-$(date -u +%Y%m%dT%H%M%SZ).tgz" data .env
 rm -rf data
 mkdir -p data
 
-# 3) код
 git fetch origin
 git checkout main
 git pull --ff-only
 git log -1 --oneline
 
-# 4) собрать и поднять с пустой БД
 docker compose up -d --build --force-recreate --remove-orphans bot web
 docker compose ps
 docker compose logs --tail=80 bot
+
+curl -s http://127.0.0.1:8081/api/health
+docker compose exec bot printenv LIGHTER_ACCOUNT_INDEX LIGHTER_API_KEY_INDEX KILL_SWITCH DRY_RUN
 ```
 
-Ожидай `POLY_LIGHTER_1 онлайн` и health без `HALT`. Дашборд :8081 — пустая история окон. Telegram `/status`.
+Ожидай `POLY_LIGHTER_1 онлайн`, health без `HALT`. Дашборд `:8081` — пустая история. Текущее 5m-окно **не** догоняет; вход со следующей границы UTC. Telegram `/status`.
 
 Откат кода: `git log -5 --oneline`, `git checkout <коммит>`, снова `up -d --build --force-recreate`. Данные — из `backups/data-*.tgz`.
 
@@ -461,11 +476,7 @@ docker compose logs -f web
 
 После рестарта: если на бирже была позиция — flatten сразу; следующее решение только на границе окна.
 
-### Полный сброс данных + обновление кода (VPS)
-
-Тот же wipe, что в §11: SQLite, логи, история окон. **Не** трогает `.env` и ключи. Если уже сделал блок из §11 — повторять не нужно.
-
-Дашборд :8081 — вкладки **Часы** (UTC/Binance vs исполнение Lighter) и широкая таблица окон. Telegram `/status` показывает `clock_binance`.
+Полный сброс + pull — **только §11**. Дашборд :8081 — вкладки **Часы** (UTC/Binance vs исполнение Lighter) и широкая таблица окон. Telegram `/status` показывает `clock_binance`.
 
 `sync-clock-http.timer` должен быть **disabled**. Chrony: `Leap status: Normal`. Helper не включать.
 
@@ -521,7 +532,7 @@ npm run dev
 | Ошибка времени / неверные UTC-границы | вкладка **Часы** — диагностический offset Binance; на VPS проверь `chronyc tracking` и `chronyc sources -v`. Должны быть `Leap status: Normal` и выбранный источник `^*`. Binance API таймаут сам по себе вход не блокирует |
 | skip `no_market` | slug `btc-updown-5m-{ts}`, Gamma 404 — окно без рынка, не подставлять соседнее |
 | skip `below_th` | **норма**, большинство окон |
-| `sendTx` / nonce | второй процесс с тем же api_key_index; один бот на ключ |
+| `sendTx` / nonce / `closed_away` через ~11 с | второй процесс на том же `LIGHTER_ACCOUNT_INDEX` (часто зомби `donchian-bot_b`); один бот на аккаунт и на `api_key_index` |
 | `stop_missing` / HALT после входа | проверь доступность Lighter и reduce-only stop; не снимай HALT, пока позиция flat и в `/api/orders` нет лишнего условного ордера |
 | Donchian позиции закрылись | **тот же account_index** — останови POLY, разберись, больше никогда не шарь счёт |
 | web unhealthy / не стартует | `bot` не healthy, смотри `logs bot` |

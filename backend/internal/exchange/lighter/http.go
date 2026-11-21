@@ -153,10 +153,6 @@ func (c *HTTPClient) doGET(ctx context.Context, path string, q url.Values, auth,
 			c.audit("http get", "path", path, "status", resp.StatusCode, "attempt", attempt, "ms", time.Since(started).Milliseconds(), "err", err.Error())
 			return nil, err
 		}
-		ms := time.Since(started).Milliseconds()
-		if ms >= 250 || attempt > 0 {
-			c.audit("http get", "path", path, "status", resp.StatusCode, "attempt", attempt, "ms", ms, "bytes", len(b))
-		}
 		return b, nil
 	}
 	if lastErr == nil {
@@ -515,7 +511,6 @@ func (c *HTTPClient) SendTx(ctx context.Context, txType int, txInfo string) (*Se
 		c.audit("sendTx", "tx_type", txType, "code", resp.Code, "hash", resp.TxHash, "ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return &resp, err
 	}
-	c.audit("sendTx", "tx_type", txType, "code", resp.Code, "hash", resp.TxHash, "ms", time.Since(started).Milliseconds())
 	return &resp, nil
 }
 
