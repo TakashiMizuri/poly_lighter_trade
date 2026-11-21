@@ -5,7 +5,8 @@
 
 Это **отдельный** Docker Compose, **отдельный** каталог, **отдельный** счёт Lighter, **отдельный** Telegram-бот, **отдельный** порт дашборда. Donchian (`/opt/donchian`) не останавливать и его `.env.a` не трогать.
 
-**Уже стоит на VPS и нужно подтянуть код + полный сброс БД/логов:** §11 (один блок на SSH). Не копировать `.env.example` поверх живого `.env`.
+**Уже стоит на VPS и нужно подтянуть код + полный сброс БД/логов:** §11 (один блок на SSH).  
+**Снять логи + БД для разбора (бот не останавливать):** §11.1. Не копировать `.env.example` поверх живого `.env`.
 
 | | Donchian | Этот бот |
 |--|--|--|
@@ -424,6 +425,60 @@ docker compose exec bot printenv LIGHTER_ACCOUNT_INDEX LIGHTER_API_KEY_INDEX KIL
 Ожидай `POLY_LIGHTER_1 онлайн`, health без `HALT`. Дашборд `:8081` — пустая история. Текущее 5m-окно **не** догоняет; вход со следующей границы UTC. Telegram `/status`.
 
 Откат кода: `git log -5 --oneline`, `git checkout <коммит>`, снова `up -d --build --force-recreate`. Данные — из `backups/data-*.tgz`.
+
+### 11.1 Выгрузка логов + БД для анализа (SSH)
+
+Бота **не** останавливать. Ключи в архив не попадают.
+
+На VPS:
+
+```bash
+cd /opt/poly-lighter || exit 1
+set -euo pipefail
+OUT=/tmp/poly-lighter-diagnostic
+rm -rf "$OUT"
+mkdir -p "$OUT/data"
+
+date -u > "$OUT/date.txt"
+uptime >> "$OUT/date.txt"
+hostname >> "$OUT/date.txt"
+uname -a >> "$OUT/date.txt"
+
+git rev-parse HEAD > "$OUT/git.txt"
+git log -8 --oneline >> "$OUT/git.txt"
+git status --short >> "$OUT/git.txt"
+
+docker compose ps -a > "$OUT/compose-ps.txt" 2>&1
+docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' > "$OUT/docker-ps.txt" 2>&1
+docker inspect poly-lighter-bot-1 --format \
+  '{{.Name}} image={{.Config.Image}} started={{.State.StartedAt}} status={{.State.Status}}' \
+  > "$OUT/inspect.txt" 2>&1
+docker compose exec -T bot printenv LIGHTER_NETWORK LIGHTER_ACCOUNT_INDEX LIGHTER_API_KEY_INDEX \
+  KILL_SWITCH DRY_RUN PM_THRESHOLD STOP_PRICE_PCT INSTANCE_NAME 2>/dev/null > "$OUT/env_runtime.txt"
+
+sed -E 's/^([A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASS|PRIVATE|ADDRESS|CHAT)[A-Za-z0-9_]*=).*/\1<redacted>/' .env \
+  > "$OUT/env.redacted.txt"
+
+docker compose logs --no-color --timestamps --since 168h bot > "$OUT/bot.logs.txt" 2>&1
+docker compose logs --no-color --timestamps --since 24h web > "$OUT/web.logs.txt" 2>&1
+
+docker compose exec -T bot sqlite3 /data/bot.db ".backup /data/bot-snap.db" \
+  && cp -a data/bot-snap.db "$OUT/data/" \
+  || sqlite3 data/bot.db ".backup $OUT/data/bot-snap.db" \
+  || cp -a data/bot.db "$OUT/data/" || true
+cp -a data/logs "$OUT/data/" 2>/dev/null || true
+
+tar czf /tmp/poly-lighter-diagnostic.tar.gz -C /tmp poly-lighter-diagnostic
+ls -lh /tmp/poly-lighter-diagnostic.tar.gz
+```
+
+На Windows (PowerShell):
+
+```powershell
+scp root@45.134.218.19:/tmp/poly-lighter-diagnostic.tar.gz C:\All\Develop\poly_lighter_trade\
+```
+
+В чат: «архив готов».
 
 ---
 

@@ -46,6 +46,8 @@ type livePos struct {
 	ArmedAt       time.Time
 	EntryHash     string
 	SeenAcctOpen  bool
+	ExitClientIdx int64
+	ExitHash      string
 }
 
 type Engine struct {
@@ -213,6 +215,19 @@ func (e *Engine) tick(ctx context.Context) error {
 		if now.After(exitAt) || now.Equal(exitAt) {
 			return e.settleWindow(ctx, pos, "", 0, 0)
 		}
+		nextTS := pos.WindowTS + clock.WindowSec
+		nextOpen := time.Unix(nextTS, 0).UTC()
+		prewarmNext := nextOpen.Add(-time.Duration(e.Cfg.PrewarmSeconds * float64(time.Second)))
+		if !now.Before(prewarmNext) && now.Before(exitAt.Add(-2*time.Second)) {
+			e.mu.Lock()
+			armedNext := e.armedFor == nextTS
+			e.mu.Unlock()
+			if !armedNext {
+				if err := e.arm(ctx, nextTS); err != nil {
+					e.Log.Warn("arm next", "err", err, "ts", nextTS)
+				}
+			}
+		}
 		pollAt := e.now().Add(time.Second)
 		if pollAt.After(exitAt) {
 			pollAt = exitAt
@@ -263,11 +278,16 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 			return err
 		}
 	}
-	tArm := time.Now()
-	if err := e.arm(ctx, next); err != nil {
-		e.Log.Warn("arm", "err", err, "ts", next)
+	e.mu.Lock()
+	alreadyArmed := e.armedFor == next
+	e.mu.Unlock()
+	if !alreadyArmed {
+		tArm := time.Now()
+		if err := e.arm(ctx, next); err != nil {
+			e.Log.Warn("arm", "err", err, "ts", next)
+		}
+		e.traceDur("arm", tArm)
 	}
-	e.traceDur("arm", tArm)
 	tReady := time.Now()
 	_ = e.refreshReady(ctx)
 	e.traceDur("ready", tReady)
@@ -338,7 +358,12 @@ func (e *Engine) refreshReady(ctx context.Context) error {
 }
 
 func (e *Engine) arm(ctx context.Context, ts int64) error {
-	e.setState(StateArming)
+	e.mu.Lock()
+	holding := e.pos != nil
+	e.mu.Unlock()
+	if !holding {
+		e.setState(StateArming)
+	}
 	slug := e.Cfg.EventSlug(ts)
 	mkt, err := e.PM.Resolve(ctx, slug)
 	if err != nil {
@@ -577,7 +602,8 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	res, err := e.Signer.MarketIOC(sendCtx, e.Cfg.Symbol, buy, qty, px, e.Cfg.MarketSlippage, clientIdx, false)
 	sendCancel()
 	e.traceDur("send", tSend)
-	e.traceOpenTo("send_ack", e.correctedTime(time.Now()).UTC())
+	sendAckAt := e.correctedTime(time.Now()).UTC()
+	e.traceOpenTo("send_ack", sendAckAt)
 	w.State = "sent"
 	e.saveWindow(ctx, w)
 	_ = e.Store.InsertOrder(ctx, ts, "entry", errString(err, "sent"), clientIdx, hashOf(res), qty, px, nil)
@@ -664,6 +690,9 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 	e.traceDur("order_get", tOrd)
 	cancel()
+	if !fillLag.Valid {
+		fillLag = sql.NullFloat64{Float64: float64(sendAckAt.Sub(time.Unix(ts, 0).UTC()) / time.Millisecond), Valid: true}
+	}
 	if fillLag.Valid && e.tr != nil {
 		e.tr.t.MsOpenToExchange = fillLag.Float64
 	}
@@ -764,7 +793,7 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 		}
 	} else if reason == "stop" || reason == "closed_away" {
 		e.Log.Warn("account still open after detected close, flattening", "reason", reason)
-		cpx, cfee, err := e.marketClose(ctx, pos)
+		cpx, cfee, err := e.sendMarketClose(ctx, pos, 800*time.Millisecond)
 		if err != nil {
 			e.alert(ctx, "error", "flatten", err.Error())
 		}
@@ -777,7 +806,7 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 				e.Log.Warn("cancel stop before window close", "err", err)
 			}
 		}
-		cpx, cfee, err := e.marketClose(ctx, pos)
+		cpx, cfee, err := e.sendMarketClose(ctx, pos, 800*time.Millisecond)
 		if err != nil {
 			e.alert(ctx, "error", "flatten", err.Error())
 		}
@@ -785,9 +814,9 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 			px, fee = cpx, cfee
 		}
 	}
-	retryUntil := deadline.Add(2 * time.Second)
-	if reason == "stop" || reason == "closed_away" {
-		retryUntil = e.now().Add(2 * time.Second)
+	retryUntil := e.now().Add(500 * time.Millisecond)
+	if retryUntil.After(deadline.Add(400 * time.Millisecond)) {
+		retryUntil = deadline.Add(400 * time.Millisecond)
 	}
 	for !alreadyFlat && e.now().Before(retryUntil) {
 		flat, _, err := e.isFlat(ctx)
@@ -795,12 +824,12 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 			break
 		}
 		late = e.now().After(deadline)
-		cpx, cfee, _ := e.marketClose(ctx, pos)
+		cpx, cfee, _ := e.sendMarketClose(ctx, pos, 0)
 		if cpx > 0 {
 			px = cpx
 			fee += cfee
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 	}
 	if flat, _, err := e.isFlat(ctx); err != nil || !flat {
 		late = true
@@ -868,11 +897,18 @@ func (e *Engine) settleWindow(ctx context.Context, pos *livePos, reason string, 
 	e.setState(StateIdle)
 	e.flogWindow("exit", w)
 	e.alert(ctx, "info", "exit", fmt.Sprintf("%s pnl=%.2f ret=%.2fbps eq=%.2f", pos.Side, pnl-fees, ret*1e4, eq))
+	if pos.ExitClientIdx != 0 && pos.ExitHash != "" {
+		e.refineExitAsync(pos, pos.ExitClientIdx, pos.ExitHash)
+	}
 	e.shadowAsync(pos.WindowTS)
 	return e.waitNextOpen(ctx, pos.WindowTS+clock.WindowSec)
 }
 
 func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64, err error) {
+	return e.sendMarketClose(ctx, pos, 800*time.Millisecond)
+}
+
+func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait time.Duration) (px, fee float64, err error) {
 	if e.Cfg.DryRun || e.Signer == nil {
 		px, err = e.btcPx(ctx)
 		return px, 0, err
@@ -888,12 +924,56 @@ func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64
 	if err != nil {
 		return 0, 0, err
 	}
-	meta := e.Markets[e.Cfg.Symbol]
-	fillPx, _, fillFee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, idx, hashOf(res), ref, 1500*time.Millisecond)
-	if fillPx <= 0 {
-		fillPx = ref
+	pos.ExitClientIdx = idx
+	pos.ExitHash = hashOf(res)
+	if fillWait <= 0 {
+		return ref, 0, nil
 	}
-	return fillPx, fillFee, nil
+	meta := e.Markets[e.Cfg.Symbol]
+	wctx, cancel := context.WithTimeout(context.Background(), fillWait)
+	fillPx, fillQty, fillFee, _ := e.HTTP.WaitFillFor(wctx, e.Cfg.AccountIndex, meta.MarketID, idx, pos.ExitHash, 0, fillWait)
+	cancel()
+	if fillQty > 0 && fillPx > 0 {
+		pos.ExitHash = "" // already booked from fill
+		return fillPx, fillFee, nil
+	}
+	return ref, 0, nil
+}
+
+func (e *Engine) refineExitAsync(pos *livePos, clientIdx int64, txHash string) {
+	if e.HTTP == nil || pos == nil || e.Store == nil {
+		return
+	}
+	windowTS := pos.WindowTS
+	side := pos.Side
+	entry := pos.EntryPx
+	notional := pos.Notional
+	entryFees := pos.Fees
+	meta := e.Markets[e.Cfg.Symbol]
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		px, qty, fee, _ := e.HTTP.WaitFillFor(ctx, e.Cfg.AccountIndex, meta.MarketID, clientIdx, txHash, 0, 3500*time.Millisecond)
+		if qty <= 0 || px <= 0 {
+			return
+		}
+		w, err := e.Store.GetWindow(ctx, windowTS)
+		if err != nil {
+			return
+		}
+		w.LighterExitPx = sql.NullFloat64{Float64: px, Valid: true}
+		fees := entryFees + fee
+		if w.FeesUSD.Valid && w.FeesUSD.Float64 > fees {
+			fees = w.FeesUSD.Float64
+		}
+		w.FeesUSD = sql.NullFloat64{Float64: fees, Valid: true}
+		if entry > 0 {
+			ret := strategy.Sign(side) * (px/entry - 1)
+			w.RetBps = sql.NullFloat64{Float64: ret * 1e4, Valid: true}
+			w.PnLUSD = sql.NullFloat64{Float64: notional*ret - fees, Valid: true}
+		}
+		_ = e.Store.UpdateWindow(ctx, w)
+	}()
 }
 
 func (e *Engine) ensureFlat(ctx context.Context, why string) error {
@@ -932,7 +1012,7 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 		if live.Qty <= 0 {
 			break
 		}
-		_, _, err := e.marketClose(ctx, live)
+		_, _, err := e.sendMarketClose(ctx, live, 0)
 		if err != nil {
 			e.Log.Warn("flatten retry", "err", err)
 		}

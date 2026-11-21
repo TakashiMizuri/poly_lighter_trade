@@ -306,10 +306,17 @@ func (c *HTTPClient) WaitFillFor(ctx context.Context, accountIndex int64, market
 	if budget <= 0 {
 		budget = 800 * time.Millisecond
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	fillCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	deadline := time.Now().Add(budget)
+	const minGET = 400 * time.Millisecond
 	for {
+		if time.Until(deadline) < minGET {
+			return fallback, 0, 0, 0
+		}
 		fills, err := c.AccountTradesUrgent(fillCtx, accountIndex, marketID, 100)
 		if err == nil {
 			subset := FillsMatching(fills, clientIdx, txHash)
