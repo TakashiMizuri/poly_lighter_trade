@@ -19,6 +19,7 @@ export function skipLabel(reason: string, threshold = 0.65): string {
     quote_incoherent: "котировка Up/Down не сходится",
     halt: "HALT",
     ready: "не готов (equity/цена/flat)",
+    venue: "Lighter недоступен (DNS/сеть)",
     equity_too_small: "мало equity / лот",
     order_failed: "ордер не ушёл",
     entry_unfilled_after_send: "ордер без fill",

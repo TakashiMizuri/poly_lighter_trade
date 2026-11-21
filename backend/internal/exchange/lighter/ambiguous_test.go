@@ -23,6 +23,11 @@ func TestIsAmbiguousSubmit(t *testing.T) {
 		Net: "tcp",
 		Err: &net.DNSError{Err: "i/o timeout", Name: "mainnet.zklighter.elliot.ai", IsTimeout: true},
 	}
+	dialIPTimeout := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: timeoutErr{},
+	}
 	connReset := &net.OpError{
 		Op:  "read",
 		Net: "tcp",
@@ -43,9 +48,11 @@ func TestIsAmbiguousSubmit(t *testing.T) {
 		{"canceled", context.Canceled, true},
 		{"wrapped deadline", fmt.Errorf("Post sendTx: %w", context.DeadlineExceeded), true},
 		{"url deadline", &url.Error{Op: "Post", URL: "https://example/api/v1/sendTx", Err: context.DeadlineExceeded}, true},
-		{"net timeout", timeoutErr{}, true},
+		{"net timeout read-phase", timeoutErr{}, true},
 		{"url net timeout", &url.Error{Op: "Post", URL: "https://example", Err: timeoutErr{}}, true},
-		{"dns i/o timeout", dnsTimeout, true},
+		{"dns i/o timeout", dnsTimeout, false},
+		{"dial ip timeout", dialIPTimeout, false},
+		{"url lookup string", &url.Error{Op: "Post", URL: "https://example", Err: errors.New("dial tcp: lookup mainnet.zklighter.elliot.ai: i/o timeout")}, false},
 		{"eof", io.EOF, true},
 		{"econnreset", syscall.ECONNRESET, true},
 		{"epipe", syscall.EPIPE, true},
@@ -63,5 +70,15 @@ func TestIsAmbiguousSubmit(t *testing.T) {
 				t.Fatalf("IsAmbiguousSubmit(%v)=%v want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestIsPreConnectFail(t *testing.T) {
+	err := fmt.Errorf(`Post "https://mainnet.zklighter.elliot.ai/api/v1/sendTx": dial tcp: lookup mainnet.zklighter.elliot.ai: i/o timeout`)
+	if !IsPreConnectFail(err) {
+		t.Fatal("expected pre-connect")
+	}
+	if IsAmbiguousSubmit(err) {
+		t.Fatal("DNS lookup must not be ambiguous")
 	}
 }

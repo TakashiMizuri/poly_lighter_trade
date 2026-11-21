@@ -265,8 +265,14 @@ func (e *Engine) markReadyAfterClose(px, eq float64) {
 }
 
 func (e *Engine) sleepToExit(ctx context.Context, ts int64) error {
-	e.setState(StateIdle)
 	e.shadowAsync(ts)
+	if e.isHalted() {
+		// Stay in HALT and return to the Run/tick halt loop — do not arm/decide
+		// the next window (that would flash DECIDE/IDLE while kill-switch is on).
+		e.setState(StateHalt)
+		return clock.SleepUntil(ctx, e.now().Add(time.Second), e.now)
+	}
+	e.setState(StateIdle)
 	return e.waitNextOpen(ctx, ts+clock.WindowSec)
 }
 

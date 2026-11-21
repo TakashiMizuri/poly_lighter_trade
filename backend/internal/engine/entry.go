@@ -64,7 +64,11 @@ func (e *Engine) arm(ctx context.Context, ts int64) error {
 func (e *Engine) decide(ctx context.Context, ts int64) error {
 	e.beginTrace(ts)
 	e.stampLateStart()
-	e.setState(StateDecide)
+	if e.isHalted() {
+		e.setState(StateHalt)
+	} else {
+		e.setState(StateDecide)
+	}
 	e.Log.Info("decide", "ts", ts, "elapsed_ms", e.now().Sub(time.Unix(ts, 0).UTC()).Milliseconds())
 	if e.consumedTS == ts {
 		return e.sleepToExit(ctx, ts)
@@ -220,6 +224,13 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	if _, _, latest := e.entryElapsed(ts); latest >= e.Cfg.EntryMaxLag {
 		return e.finishSkip(ctx, w, "late", "deadline expired before order request")
 	}
+	// Do not fire a blind entry if Lighter is unreachable right now (DNS/dial).
+	if err := e.venuePreflight(ctx, deadline); err != nil {
+		e.mu.Lock()
+		e.readyOK = false
+		e.mu.Unlock()
+		return e.finishSkip(ctx, w, "venue", err.Error())
+	}
 	sendCtx, sendCancel := context.WithDeadline(ctx, deadline)
 	tSend := time.Now()
 	e.traceOpenTo("send", e.correctedTime(tSend).UTC())
@@ -233,10 +244,14 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	txHash := hashOf(res)
 	_ = e.Store.InsertOrder(ctx, ts, "entry", errString(err, "sent"), clientIdx, txHash, qty, px, nil)
 	if err != nil {
-		// Timeout/reset after the POST left the process is not a clean reject:
-		// reconcile via fills/position instead of treating it as "order never sent".
+		// DNS/dial failures never reached the venue → clean skip.
+		// Timeout/reset after the POST may have left the process → reconcile.
 		if !lighter.IsAmbiguousSubmit(err) {
-			return e.finishSkip(ctx, w, "order_failed", err.Error())
+			reason := "order_failed"
+			if lighter.IsPreConnectFail(err) {
+				reason = "venue"
+			}
+			return e.finishSkip(ctx, w, reason, err.Error())
 		}
 		e.Log.Warn("entry send ambiguous; reconciling", "err", err, "client_idx", clientIdx)
 		e.alert(ctx, "warn", "entry_send_ambiguous", fmt.Sprintf("ack lost (%v); reconciling by client_idx=%d", err, clientIdx))
@@ -369,6 +384,27 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		lagTxt = fmt.Sprintf("%.0fms", w.FillLagMS.Float64)
 	}
 	e.alert(ctx, "info", "entry", fmt.Sprintf("%s qty=%.6f px=%.2f p_up=%.3f lag=%s", side, usedQty, fillPx, pUp, lagTxt))
+	return nil
+}
+
+// venuePreflight checks that Lighter answers before we submit an entry.
+// Failures here skip the window without sending (reason venue).
+func (e *Engine) venuePreflight(ctx context.Context, entryDeadline time.Time) error {
+	if e.Cfg.DryRun || e.HTTP == nil {
+		return nil
+	}
+	budget := 400 * time.Millisecond
+	if remain := time.Until(entryDeadline); remain > 0 && remain < budget {
+		budget = remain
+	}
+	if budget <= 0 {
+		return fmt.Errorf("lighter preflight: no time left before entry deadline")
+	}
+	pctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	if _, err := e.HTTP.AccountUrgent(pctx, e.Cfg.AccountIndex); err != nil {
+		return fmt.Errorf("lighter unreachable: %w", err)
+	}
 	return nil
 }
 
