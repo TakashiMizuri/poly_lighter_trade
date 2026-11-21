@@ -3,6 +3,7 @@ package lighter
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ type Signer struct {
 	Tx   *lighterclient.TxClient
 	HTTP *HTTPClient
 	Meta map[string]MarketMeta
+	Log  *slog.Logger
 
 	tokMu      sync.Mutex
 	token      string
@@ -58,7 +60,15 @@ func (s *Signer) AuthToken() (string, error) {
 type OrderResult struct {
 	TxHash           string
 	ClientOrderIndex int64
+	Nonce            int64
 	TxInfo           string
+}
+
+func (s *Signer) audit(msg string, args ...any) {
+	if s == nil || s.Log == nil {
+		return
+	}
+	s.Log.Info(msg, args...)
 }
 
 func (s *Signer) meta(symbol string) (MarketMeta, error) {
@@ -80,6 +90,7 @@ func (s *Signer) PrepareNonce(ctx context.Context) error {
 		return err
 	}
 	s.nextNonce, s.nonceReady = n, true
+	s.audit("nonce ready", "nonce", n, "account", s.Tx.GetAccountIndex(), "api_key_index", s.Tx.GetApiKeyIndex())
 	return nil
 }
 
@@ -145,24 +156,30 @@ func (s *Signer) MarketIOC(ctx context.Context, symbol string, buy bool, qty, re
 	}
 	nonce, err := s.takeNonce(ctx)
 	if err != nil {
+		s.audit("order skip", "kind", "market_ioc", "symbol", symbol, "client_idx", clientIdx, "err", err.Error())
 		return nil, err
 	}
 	info, err := s.Tx.GetCreateOrderTransaction(req, &types.TransactOpts{Nonce: &nonce})
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order sign", "kind", "market_ioc", "nonce", nonce, "client_idx", clientIdx, "err", err.Error())
 		return nil, err
 	}
 	js, err := info.GetTxInfo()
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order sign", "kind", "market_ioc", "nonce", nonce, "client_idx", clientIdx, "err", err.Error())
 		return nil, err
 	}
+	s.audit("order send", "kind", "market_ioc", "symbol", symbol, "buy", buy, "qty", qty, "ref", refPrice, "worst", worst, "reduce_only", reduceOnly, "client_idx", clientIdx, "nonce", nonce, "is_ask", isAsk)
 	resp, err := s.HTTP.SendTx(ctx, txtypes.TxTypeL2CreateOrder, js)
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order result", "kind", "market_ioc", "client_idx", clientIdx, "nonce", nonce, "err", err.Error())
 		return nil, err
 	}
-	return &OrderResult{TxHash: resp.TxHash, ClientOrderIndex: clientIdx, TxInfo: js}, nil
+	s.audit("order result", "kind", "market_ioc", "client_idx", clientIdx, "nonce", nonce, "hash", resp.TxHash)
+	return &OrderResult{TxHash: resp.TxHash, ClientOrderIndex: clientIdx, Nonce: nonce, TxInfo: js}, nil
 }
 
 // UpdateLeverage sets isolated margin so notional ≈ equity * leverage is allowed by the venue.
@@ -200,9 +217,13 @@ func (s *Signer) UpdateLeverage(ctx context.Context, symbol string, leverage flo
 		s.invalidateNonce()
 		return err
 	}
+	s.audit("order send", "kind", "leverage", "symbol", symbol, "leverage", leverage, "imf", imf, "nonce", nonce)
 	_, err = s.HTTP.SendTx(ctx, txtypes.TxTypeL2UpdateLeverage, js)
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order result", "kind", "leverage", "nonce", nonce, "err", err.Error())
+	} else {
+		s.audit("order result", "kind", "leverage", "nonce", nonce)
 	}
 	return err
 }
@@ -252,24 +273,30 @@ func (s *Signer) StopLoss(ctx context.Context, symbol string, buyPosition bool, 
 	}
 	nonce, err := s.takeNonce(ctx)
 	if err != nil {
+		s.audit("order skip", "kind", "stop_loss", "client_idx", clientIdx, "err", err.Error())
 		return nil, err
 	}
 	info, err := s.Tx.GetCreateOrderTransaction(req, &types.TransactOpts{Nonce: &nonce})
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order sign", "kind", "stop_loss", "nonce", nonce, "client_idx", clientIdx, "err", err.Error())
 		return nil, err
 	}
 	js, err := info.GetTxInfo()
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order sign", "kind", "stop_loss", "nonce", nonce, "client_idx", clientIdx, "err", err.Error())
 		return nil, err
 	}
+	s.audit("order send", "kind", "stop_loss", "symbol", symbol, "buy_position", buyPosition, "qty", qty, "stop", stop, "worst", worst, "client_idx", clientIdx, "nonce", nonce, "is_ask", isAsk, "reduce_only", true)
 	resp, err := s.HTTP.SendTx(ctx, txtypes.TxTypeL2CreateOrder, js)
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order result", "kind", "stop_loss", "client_idx", clientIdx, "nonce", nonce, "err", err.Error())
 		return nil, err
 	}
-	return &OrderResult{TxHash: resp.TxHash, ClientOrderIndex: clientIdx, TxInfo: js}, nil
+	s.audit("order result", "kind", "stop_loss", "client_idx", clientIdx, "nonce", nonce, "hash", resp.TxHash)
+	return &OrderResult{TxHash: resp.TxHash, ClientOrderIndex: clientIdx, Nonce: nonce, TxInfo: js}, nil
 }
 
 func (s *Signer) CancelAll(ctx context.Context) error {
@@ -277,6 +304,7 @@ func (s *Signer) CancelAll(ctx context.Context) error {
 	defer s.txMu.Unlock()
 	nonce, err := s.takeNonce(ctx)
 	if err != nil {
+		s.audit("order skip", "kind", "cancel_all", "err", err.Error())
 		return err
 	}
 	info, err := s.Tx.GetCancelAllOrdersTransaction(&types.CancelAllOrdersTxReq{
@@ -285,16 +313,22 @@ func (s *Signer) CancelAll(ctx context.Context) error {
 	}, &types.TransactOpts{Nonce: &nonce})
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order sign", "kind", "cancel_all", "nonce", nonce, "err", err.Error())
 		return err
 	}
 	js, err := info.GetTxInfo()
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order sign", "kind", "cancel_all", "nonce", nonce, "err", err.Error())
 		return err
 	}
+	s.audit("order send", "kind", "cancel_all", "nonce", nonce)
 	_, err = s.HTTP.SendTx(ctx, txtypes.TxTypeL2CancelAllOrders, js)
 	if err != nil {
 		s.invalidateNonce()
+		s.audit("order result", "kind", "cancel_all", "nonce", nonce, "err", err.Error())
+	} else {
+		s.audit("order result", "kind", "cancel_all", "nonce", nonce)
 	}
 	return err
 }

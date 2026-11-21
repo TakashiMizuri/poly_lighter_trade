@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -19,6 +20,7 @@ type HTTPClient struct {
 	BaseURL     string
 	HTTP        *http.Client
 	AuthToken   string
+	Log         *slog.Logger
 	mu          sync.Mutex
 	tokenFn     func(context.Context) (string, error)
 	minInterval time.Duration
@@ -81,11 +83,19 @@ func (c *HTTPClient) getUrgent(ctx context.Context, path string, q url.Values, a
 	return c.doGET(ctx, path, q, auth, false)
 }
 
+func (c *HTTPClient) audit(msg string, args ...any) {
+	if c == nil || c.Log == nil {
+		return
+	}
+	c.Log.Info(msg, args...)
+}
+
 func (c *HTTPClient) doGET(ctx context.Context, path string, q url.Values, auth, paced bool) ([]byte, error) {
 	u := c.BaseURL + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
+	started := time.Now()
 	var lastErr error
 	attempts := 12
 	if !paced {
@@ -116,16 +126,19 @@ func (c *HTTPClient) doGET(ctx context.Context, path string, q url.Values, auth,
 		}
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
+			c.audit("http get", "path", path, "attempt", attempt, "ms", time.Since(started).Milliseconds(), "err", err.Error())
 			return nil, err
 		}
 		b, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
+			c.audit("http get", "path", path, "attempt", attempt, "ms", time.Since(started).Milliseconds(), "err", err.Error())
 			return nil, err
 		}
 		if retryableHTTP(resp.StatusCode, b) {
 			wait := retryAfter(resp.Header.Get("Retry-After"), attempt)
 			lastErr = fmt.Errorf("GET %s: HTTP %d: %s", path, resp.StatusCode, truncate(string(b), 200))
+			c.audit("http get retry", "path", path, "status", resp.StatusCode, "attempt", attempt, "wait_ms", wait.Milliseconds(), "body", truncate(string(b), 160))
 			t := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
@@ -136,13 +149,20 @@ func (c *HTTPClient) doGET(ctx context.Context, path string, q url.Values, auth,
 			continue
 		}
 		if resp.StatusCode >= 400 {
-			return nil, fmt.Errorf("GET %s: HTTP %d: %s", path, resp.StatusCode, truncate(string(b), 400))
+			err := fmt.Errorf("GET %s: HTTP %d: %s", path, resp.StatusCode, truncate(string(b), 400))
+			c.audit("http get", "path", path, "status", resp.StatusCode, "attempt", attempt, "ms", time.Since(started).Milliseconds(), "err", err.Error())
+			return nil, err
+		}
+		ms := time.Since(started).Milliseconds()
+		if ms >= 250 || attempt > 0 {
+			c.audit("http get", "path", path, "status", resp.StatusCode, "attempt", attempt, "ms", ms, "bytes", len(b))
 		}
 		return b, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("GET %s: rate limited", path)
 	}
+	c.audit("http get", "path", path, "ms", time.Since(started).Milliseconds(), "err", lastErr.Error())
 	return nil, lastErr
 }
 
@@ -476,20 +496,26 @@ func (c *HTTPClient) GetNextNonceContext(ctx context.Context, accountIndex int64
 }
 
 func (c *HTTPClient) SendTx(ctx context.Context, txType int, txInfo string) (*SendTxResp, error) {
+	started := time.Now()
 	form := url.Values{}
 	form.Set("tx_type", strconv.Itoa(txType))
 	form.Set("tx_info", txInfo)
 	b, err := c.postForm(ctx, "/api/v1/sendTx", form)
 	if err != nil {
+		c.audit("sendTx", "tx_type", txType, "ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return nil, err
 	}
 	var resp SendTxResp
 	if err := json.Unmarshal(b, &resp); err != nil {
+		c.audit("sendTx", "tx_type", txType, "ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return nil, err
 	}
 	if resp.Code != 200 && resp.Code != 0 {
-		return &resp, fmt.Errorf("sendTx code=%d msg=%s hash=%s", resp.Code, resp.Message, resp.TxHash)
+		err := fmt.Errorf("sendTx code=%d msg=%s hash=%s", resp.Code, resp.Message, resp.TxHash)
+		c.audit("sendTx", "tx_type", txType, "code", resp.Code, "hash", resp.TxHash, "ms", time.Since(started).Milliseconds(), "err", err.Error())
+		return &resp, err
 	}
+	c.audit("sendTx", "tx_type", txType, "code", resp.Code, "hash", resp.TxHash, "ms", time.Since(started).Milliseconds())
 	return &resp, nil
 }
 

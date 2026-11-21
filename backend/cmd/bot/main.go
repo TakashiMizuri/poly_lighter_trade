@@ -46,6 +46,7 @@ func main() {
 	defer st.Close()
 
 	httpClient := lighter.NewHTTP(cfg.BaseURL)
+	httpClient.Log = log
 	markets := map[string]lighter.MarketMeta{}
 	if err := retryTransient(ctx, log, "markets", 2*time.Minute, func() error {
 		resolved, err := httpClient.ResolveMarkets(ctx, []string{cfg.Symbol})
@@ -70,6 +71,7 @@ func main() {
 			os.Exit(1)
 		}
 		signer.Meta = markets
+		signer.Log = log
 		httpClient.SetTokenSource(func(context.Context) (string, error) {
 			return signer.AuthToken()
 		})
