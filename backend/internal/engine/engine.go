@@ -43,6 +43,7 @@ type livePos struct {
 	StopPx        float64
 	Fees          float64
 	FillLagMS     float64
+	ArmedAt       time.Time
 }
 
 type Engine struct {
@@ -197,13 +198,13 @@ func (e *Engine) tick(ctx context.Context) error {
 	pos := e.pos
 	e.mu.Unlock()
 	if pos != nil {
-		// A native reduce-only stop may have closed the position while this
-		// process was asleep. Detect that before waiting for the window close.
-		if !e.Cfg.DryRun && e.Signer != nil {
-			flat, _, err := e.isFlat(ctx)
-			if err == nil && flat {
-				return e.flattenWindow(ctx, pos, "stop")
-			}
+		// Only treat a native stop as filled when the stop order actually
+		// printed (or price crossed the trigger and the account is flat).
+		// A single REST "flat" snapshot is not enough: after entry the
+		// account endpoint can lag and the bot used to market-close a live
+		// position while labelling it sl.
+		if !e.Cfg.DryRun && e.Signer != nil && e.stopFilled(ctx, pos) {
+			return e.flattenWindow(ctx, pos, "stop")
 		}
 		if now.Sub(time.Unix(0, int64(pos.EntryTS*1e9))) > e.Cfg.HaltPositionMax && pos.EntryTS > 0 {
 			e.halt(ctx, "position_over_6m")
@@ -673,7 +674,7 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		WindowTS: ts, Side: side, Qty: usedQty, Notional: usedQty * fillPx,
 		EntryPx: fillPx, EntryTS: fillTS, EquityBefore: eq, ClientIdx: clientIdx, Fees: fee,
 		StopClientIdx: stopIdx, StopPx: stopPx,
-		FillLagMS: fillLag.Float64,
+		FillLagMS: fillLag.Float64, ArmedAt: time.Now(),
 	}
 	e.mu.Unlock()
 	entryTS := fillTS
@@ -748,9 +749,15 @@ func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string)
 		fee = stopFee
 		if px > 0 && qty > 0 {
 			_ = e.Store.InsertOrder(ctx, pos.WindowTS, "stop_loss_fill", "filled", pos.StopClientIdx, "", qty, px, map[string]any{"stop_px": pos.StopPx, "sl_slip_bps": strategy.SLSlipBps(pos.EntryPx, px, pos.Side, e.Cfg.StopPricePct)})
-		}
-		if px <= 0 {
-			px, _ = e.btcPx(ctx)
+		} else {
+			last, _ := e.btcPx(ctx)
+			flat, _, ferr := e.isFlat(ctx)
+			if ferr != nil || !flat || !strategy.StopHit(last, pos.Side, pos.StopPx) {
+				e.Log.Warn("false stop signal, keeping position", "side", pos.Side, "stop", pos.StopPx, "last", last)
+				e.setState(StateInPosition)
+				return nil
+			}
+			px = last
 		}
 	} else {
 		if pos.StopClientIdx > 0 && e.Signer != nil {
@@ -774,7 +781,11 @@ func (e *Engine) flattenWindow(ctx context.Context, pos *livePos, reason string)
 			break
 		}
 		late = e.now().After(deadline)
-		_, _, _ = e.marketClose(ctx, pos)
+		cpx, cfee, _ := e.marketClose(ctx, pos)
+		if cpx > 0 {
+			px = cpx
+			fee += cfee
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	if flat, _, err := e.isFlat(ctx); err != nil || !flat {
@@ -994,6 +1005,28 @@ func (e *Engine) isFlat(ctx context.Context) (bool, lighter.Position, error) {
 		return true, lighter.Position{}, nil
 	}
 	return false, p, nil
+}
+
+func (e *Engine) stopFilled(ctx context.Context, pos *livePos) bool {
+	if pos == nil || pos.StopClientIdx == 0 || pos.StopPx <= 0 {
+		return false
+	}
+	if !pos.ArmedAt.IsZero() && time.Since(pos.ArmedAt) < 3*time.Second {
+		return false
+	}
+	meta := e.Markets[e.Cfg.Symbol]
+	fills, err := e.HTTP.AccountTradesUrgent(ctx, e.Cfg.AccountIndex, meta.MarketID, 100)
+	if err == nil {
+		if _, q, _, _ := lighter.VWAP(lighter.FillsMatching(fills, pos.StopClientIdx, "")); q > 0 {
+			return true
+		}
+	}
+	last, err := e.btcPx(ctx)
+	if err != nil || !strategy.StopHit(last, pos.Side, pos.StopPx) {
+		return false
+	}
+	flat, _, ferr := e.isFlat(ctx)
+	return ferr == nil && flat
 }
 
 const entryFillConfirm = 5 * time.Second

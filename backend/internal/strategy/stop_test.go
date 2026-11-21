@@ -31,4 +31,10 @@ func TestStopHit(t *testing.T) {
 	if StopHit(99_880, SideLong, 99_875) {
 		t.Fatal("long not yet")
 	}
+	if StopHit(56_155.4, SideShort, 56_173.0) {
+		t.Fatal("short not yet: last below stop")
+	}
+	if !StopHit(56_180, SideShort, 56_173.0) {
+		t.Fatal("short hit")
+	}
 }
