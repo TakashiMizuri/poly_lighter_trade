@@ -2,11 +2,15 @@ package engine
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"poly-lighter.trade/bot/internal/config"
+	"poly-lighter.trade/bot/internal/exchange/lighter"
 	"poly-lighter.trade/bot/internal/store"
 	"poly-lighter.trade/bot/internal/strategy"
 )
@@ -188,6 +192,111 @@ func TestSideSignPnL(t *testing.T) {
 	if ret <= 0 {
 		t.Fatal(ret)
 	}
+}
+
+func TestPersistCtxOutlivesParent(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctx, done := persistCtx(parent)
+	defer done()
+	if err := ctx.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInsertOrderSurvivesCancelledContext(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	e := New(testConfig(), st, nil, nil, nil, nil, nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.insertOrder(ctx, 1795341600, "exit", "context deadline exceeded", 334400010, "dead", 0.0004, 60895.3, nil)
+	rows, err := st.ListOrders(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0]["client_order_index"] != int64(334400010) || rows[0]["kind"] != "exit" {
+		t.Fatalf("%v", rows)
+	}
+}
+
+func TestRecordFillLagIgnoresWholeSecondStamp(t *testing.T) {
+	windowTS := int64(1795334400)
+	clientIdx := int64(334400003)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"code":200,"orders":[{"client_order_index":%d,"created_at":%d}]}`, clientIdx, windowTS)
+	}))
+	defer srv.Close()
+	st := openTestStore(t)
+	insertLagWindow(t, st, windowTS)
+	e := newLagEngine(t, st, srv.URL)
+	e.recordFillLag(windowTS, clientIdx)
+	got, err := st.GetWindow(context.Background(), windowTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FillLagMS.Valid {
+		t.Fatalf("whole-second stamp stored %+v", got.FillLagMS)
+	}
+}
+
+func TestRecordFillLagRetriesThenBooks(t *testing.T) {
+	windowTS := int64(1795334400)
+	clientIdx := int64(334400003)
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			fmt.Fprint(w, `{"code":0,"orders":[]}`)
+			return
+		}
+		fmt.Fprintf(w, `{"code":200,"orders":[{"client_order_index":%d,"created_at":%d}]}`, clientIdx, windowTS*1000+420)
+	}))
+	defer srv.Close()
+	st := openTestStore(t)
+	insertLagWindow(t, st, windowTS)
+	e := newLagEngine(t, st, srv.URL)
+	e.recordFillLag(windowTS, clientIdx)
+	got, err := st.GetWindow(context.Background(), windowTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits < 2 || !got.FillLagMS.Valid || got.FillLagMS.Float64 != 420 {
+		t.Fatalf("hits %d lag %+v", hits, got.FillLagMS)
+	}
+	if got.Timings == nil || got.Timings.MsOpenToExchange != 420 || got.Timings.MsSendToExchange != 166 {
+		t.Fatalf("timings %+v", got.Timings)
+	}
+}
+
+func openTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
+func insertLagWindow(t *testing.T, st *store.Store, windowTS int64) {
+	t.Helper()
+	row := store.Window{WindowTS: windowTS, Side: "short", State: "IN_POSITION", Timings: &store.Timings{OpenUnix: float64(windowTS), MsOpenToSend: 254}}
+	row.LighterEntryPx.Float64, row.LighterEntryPx.Valid = 59149.5, true
+	if err := st.InsertWindow(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newLagEngine(t *testing.T, st *store.Store, baseURL string) *Engine {
+	t.Helper()
+	cfg := testConfig()
+	cfg.AccountIndex = 7
+	return New(cfg, st, lighter.NewHTTP(baseURL), nil, nil, nil, nil, nil, nil)
 }
 
 func TestNoTwoPositionsInvariant(t *testing.T) {

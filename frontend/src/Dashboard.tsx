@@ -47,6 +47,11 @@ function ms(n: number | null | undefined) {
   return `${n.toFixed(0)} ms`;
 }
 
+function lagPair(n: number | null | undefined, p50: number | null | undefined, p90: number | null | undefined) {
+  if (!n) return "— / —";
+  return `${ms(p50)} / ${ms(p90)}`;
+}
+
 function isTrade(w: WindowRow) {
   return w.side === "long" || w.side === "short";
 }
@@ -359,7 +364,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                 <div className="text-[11px] text-muted-foreground">Лаг входа</div>
                 <div className="mt-1 text-base font-medium tabular-nums">{stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"}</div>
                 <div className="mt-0.5 text-xs text-muted-foreground">
-                  p50 {ms(stats?.p50_fill_lag_ms)} · p90 {ms(stats?.p90_fill_lag_ms)} · n {stats?.n_fill_lag ?? 0}
+                  p50 {stats?.n_fill_lag ? ms(stats.p50_fill_lag_ms) : "—"} · p90 {stats?.n_fill_lag ? ms(stats.p90_fill_lag_ms) : "—"} · n {stats?.n_fill_lag ?? 0}
                 </div>
               </div>
             </div>
@@ -438,7 +443,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
             <p className="text-xs text-muted-foreground">Лаг — created_at ордера на Lighter минус :00.</p>
             <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-4">
               <Metric label="Средний лаг" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} />
-              <Metric label="p50 / p90" value={`${ms(stats?.p50_fill_lag_ms)} / ${ms(stats?.p90_fill_lag_ms)}`} />
+              <Metric label="p50 / p90" value={lagPair(stats?.n_fill_lag, stats?.p50_fill_lag_ms, stats?.p90_fill_lag_ms)} />
               <Metric label="С лагом" value={String(stats?.n_fill_lag ?? 0)} />
               <Metric label="WR" value={`${fmt((stats?.wr ?? 0) * 100, 1)}%`} sub={`mean ${fmt(stats?.mean_bps, 1)} bps`} />
             </div>
@@ -453,7 +458,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
           <TabsContent value="exec" className="space-y-3 p-4">
             <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-4">
               <Metric label="Средний лаг" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} />
-              <Metric label="p50 / p90" value={`${ms(stats?.p50_fill_lag_ms)} / ${ms(stats?.p90_fill_lag_ms)}`} />
+              <Metric label="p50 / p90" value={lagPair(stats?.n_fill_lag, stats?.p50_fill_lag_ms, stats?.p90_fill_lag_ms)} />
               <Metric label="Пары с тенью" value={String(stats?.n_paired ?? 0)} />
               <Metric label="Выходы по SL" value={String(stats?.n_sl ?? 0)} />
             </div>

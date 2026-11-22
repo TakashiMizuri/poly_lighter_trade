@@ -250,7 +250,7 @@ UPDATE windows SET
   decision_ts=?, quote_ts=?, p_up=?, p_down=?, spread=?, quote_source=?, side=?, skip_reason=?,
   lighter_entry_ts=?, lighter_entry_px=?, lighter_exit_ts=?, lighter_exit_px=?,
   qty=?, notional=?, equity_before=?, equity_after=?, pnl_usd=?, ret_bps=?, fees_usd=?,
-  entry_lag_ms=?, fill_lag_ms=?, shadow_binance_px_t1=?, shadow_ret_bps=?, pm_fav=?, state=?,
+  entry_lag_ms=?, fill_lag_ms=COALESCE(?, fill_lag_ms), shadow_binance_px_t1=?, shadow_ret_bps=?, pm_fav=?, state=?,
   stop_px=?, exit_reason=?, sl_slip_bps=?, clock_offset_ms=?, clock_rtt_ms=?, timings=?
 WHERE window_ts=?`,
 		w.DecisionTS, w.QuoteTS, w.PUp, w.PDown, w.Spread, w.QuoteSource, w.Side, w.SkipReason,
@@ -397,6 +397,34 @@ func (s *Store) CancelOpenStops(ctx context.Context, windowTS int64) error {
 UPDATE orders SET status='canceled'
 WHERE window_ts=? AND kind='stop_loss' AND status='sent'`, windowTS)
 	return err
+}
+
+// UpdateWindowFillLag records a precise exchange created_at as the entry lag.
+// A whole-second or non-positive lag is ignored. A lag already stored is kept.
+// Timings gain the exchange mark so the dashboard scale matches the column.
+func (s *Store) UpdateWindowFillLag(ctx context.Context, windowTS int64, lagMS, entryUnix float64) error {
+	if s == nil || windowTS == 0 || lagMS <= 0 {
+		return nil
+	}
+	w, err := s.GetWindow(ctx, windowTS)
+	if err != nil {
+		return err
+	}
+	if w.FillLagMS.Valid && w.FillLagMS.Float64 > 0 {
+		return nil
+	}
+	w.FillLagMS = sql.NullFloat64{Float64: lagMS, Valid: true}
+	if entryUnix > 0 {
+		w.LighterEntryTS = sql.NullFloat64{Float64: entryUnix, Valid: true}
+	}
+	if w.Timings == nil {
+		w.Timings = &Timings{OpenUnix: float64(windowTS)}
+	}
+	w.Timings.MsOpenToExchange = lagMS
+	if w.Timings.MsOpenToSend > 0 && lagMS >= w.Timings.MsOpenToSend {
+		w.Timings.MsSendToExchange = lagMS - w.Timings.MsOpenToSend
+	}
+	return s.UpdateWindow(ctx, w)
 }
 
 // UpdateWindowExit writes only the confirmed close. Shadow columns stay untouched.

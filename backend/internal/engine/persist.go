@@ -44,6 +44,22 @@ func (e *Engine) stampClock(w *store.Window) {
 	w.ClockRTTMS = sql.NullFloat64{Float64: rtt.Seconds() * 1000, Valid: true}
 }
 
+// persistCtx keeps a database write alive after the trading context has hit its deadline.
+func persistCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), time.Second)
+}
+
+func (e *Engine) insertOrder(ctx context.Context, windowTS int64, kind, status string, clientIdx int64, txHash string, qty, px float64, payload any) {
+	if e == nil || e.Store == nil {
+		return
+	}
+	wctx, cancel := persistCtx(ctx)
+	defer cancel()
+	if err := e.Store.InsertOrder(wctx, windowTS, kind, status, clientIdx, txHash, qty, px, payload); err != nil {
+		e.Log.Warn("order persist", "kind", kind, "client_idx", clientIdx, "window_ts", windowTS, "err", err)
+	}
+}
+
 func (e *Engine) saveWindow(ctx context.Context, w store.Window) {
 	e.applyTrace(&w)
 	tSQL := time.Now()

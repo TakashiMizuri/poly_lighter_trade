@@ -240,3 +240,52 @@ func TestListUnconfirmedCopiedExit(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+func TestUpdateWindowFillLagSurvivesLaterSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	w := Window{WindowTS: 1795334400, Side: "short", State: "IN_POSITION", Timings: &Timings{OpenUnix: 1795334400, MsOpenToSend: 254}}
+	w.LighterEntryPx.Float64, w.LighterEntryPx.Valid = 59149.5, true
+	w.LighterEntryTS.Float64, w.LighterEntryTS.Valid = 1795334401.946, true
+	if err := st.InsertWindow(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	created := 1795334400.420
+	if err := st.UpdateWindowFillLag(ctx, w.WindowTS, 420, created); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateWindowFillLag(ctx, w.WindowTS, 999, created+1); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetWindow(ctx, w.WindowTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.FillLagMS.Valid || got.FillLagMS.Float64 != 420 {
+		t.Fatalf("lag %+v", got.FillLagMS)
+	}
+	if got.LighterEntryTS.Float64 != created {
+		t.Fatalf("entry ts %v", got.LighterEntryTS.Float64)
+	}
+	if got.Timings == nil || got.Timings.MsOpenToExchange != 420 || got.Timings.MsSendToExchange != 166 {
+		t.Fatalf("timings %+v", got.Timings)
+	}
+	stale := got
+	stale.FillLagMS = sql.NullFloat64{}
+	stale.State = "closed"
+	if err := st.UpdateWindow(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetWindow(ctx, w.WindowTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.FillLagMS.Valid || got.FillLagMS.Float64 != 420 || got.State != "closed" {
+		t.Fatalf("snapshot cleared lag: %+v", got.FillLagMS)
+	}
+}

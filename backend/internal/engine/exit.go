@@ -397,7 +397,8 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 	idx := e.nextClientIdx(ctx)
 	res, err := e.Signer.MarketIOC(ctx, e.Cfg.Symbol, buy, pos.Qty, ref, e.Cfg.MarketSlippage, idx, true)
 	txHash := hashOf(res)
-	_ = e.Store.InsertOrder(ctx, pos.WindowTS, "exit", errString(err, "sent"), idx, txHash, pos.Qty, ref, nil)
+	// The boundary deadline may already be spent on sendTx. The order row still has to land.
+	e.insertOrder(ctx, pos.WindowTS, "exit", errString(err, "sent"), idx, txHash, pos.Qty, ref, nil)
 	if err != nil {
 		if !lighter.IsAmbiguousSubmit(err) {
 			e.failPendingClose(pos, idx, txHash)
@@ -434,7 +435,9 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 	if fill.Qty > 0 && fill.Px > 0 {
 		e.clearPendingClose()
 		if e.Store != nil {
-			_ = e.Store.UpdateOrderFill(ctx, idx, "filled", fill.Px)
+			wctx, cancel := persistCtx(ctx)
+			_ = e.Store.UpdateOrderFill(wctx, idx, "filled", fill.Px)
+			cancel()
 		}
 		return fill.Px, fill.Fee, nil
 	}

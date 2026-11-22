@@ -312,7 +312,6 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		usedQty = qty
 	}
 	fillTS := fillUnix
-	var fillLag sql.NullFloat64
 	stopPx := strategy.StopPx(fillPx, side, e.Cfg.StopPricePct)
 	stopIdx := int64(0)
 	stopHash := ""
@@ -348,33 +347,15 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 			return e.finishSkip(ctx, w, "stop_missing", stopErr.Error())
 		}
 	}
-	// Query exchange creation time only after the protective stop has been
-	// submitted; telemetry must never delay risk protection.
-	// Whole-second stamps are not a lag: they collapse any fill in the open
-	// second to 0 ms. Leave fill_lag null so the mean ignores them. The local
-	// send-ack stays in the stage trace and is not this metric.
-	octx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-	tOrd := time.Now()
-	if o, err := e.HTTP.OrderByClient(octx, e.Cfg.AccountIndex, clientIdx); err == nil {
-		if u, precise := o.CreatedUnix(); precise && u > 0 {
-			lagMS := (u - float64(ts)) * 1000
-			if lagMS > 0 {
-				fillLag = sql.NullFloat64{Float64: lagMS, Valid: true}
-				fillTS = u
-			}
-		}
-	}
-	e.traceDur("order_get", tOrd)
-	cancel()
-	if fillLag.Valid && e.tr != nil {
-		e.tr.t.MsOpenToExchange = fillLag.Float64
-	}
+	// Exchange created_at is telemetry. It is read after this function returns,
+	// so a slow accountOrders call cannot delay the stop, the position, or the next window.
+	// Whole-second stamps are not a lag: they collapse any fill in the open second to 0 ms.
 	e.mu.Lock()
 	e.pos = &livePos{
 		WindowTS: ts, Side: side, Qty: usedQty, Notional: usedQty * fillPx,
 		EntryPx: fillPx, EntryTS: fillTS, EquityBefore: eq, ClientIdx: clientIdx, Fees: fee,
 		StopClientIdx: stopIdx, StopHash: stopHash, StopPx: stopPx,
-		FillLagMS: fillLag.Float64, ArmedAt: time.Now(), EntryHash: txHash,
+		ArmedAt: time.Now(), EntryHash: txHash,
 	}
 	e.mu.Unlock()
 	entryTS := fillTS
@@ -386,7 +367,6 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	w.Qty = sql.NullFloat64{Float64: usedQty, Valid: true}
 	w.Notional = sql.NullFloat64{Float64: usedQty * fillPx, Valid: true}
 	w.FeesUSD = sql.NullFloat64{Float64: fee, Valid: true}
-	w.FillLagMS = fillLag
 	w.State = StateInPosition
 	if stopPx > 0 {
 		w.StopPx = sql.NullFloat64{Float64: stopPx, Valid: true}
@@ -395,12 +375,52 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	e.saveWindow(ctx, w)
 	e.setState(StateInPosition)
 	e.flogWindow("entry", w)
-	lagTxt := "—"
-	if w.FillLagMS.Valid {
-		lagTxt = fmt.Sprintf("%.0fms", w.FillLagMS.Float64)
-	}
-	e.alert(ctx, "info", "entry", fmt.Sprintf("%s qty=%.6f px=%.2f p_up=%.3f lag=%s", side, usedQty, fillPx, pUp, lagTxt))
+	e.alert(ctx, "info", "entry", fmt.Sprintf("%s qty=%.6f px=%.2f p_up=%.3f lag=—", side, usedQty, fillPx, pUp))
+	go e.recordFillLag(ts, clientIdx)
 	return nil
+}
+
+// recordFillLag asks Lighter for the entry order's created_at and stores the lag.
+// It runs after the stop is already in. A whole-second stamp is not a measurement.
+func (e *Engine) recordFillLag(windowTS, clientIdx int64) {
+	if e == nil || e.HTTP == nil || e.Store == nil || e.Cfg == nil || windowTS == 0 || clientIdx == 0 {
+		return
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	var created float64
+	for {
+		octx, cancel := context.WithTimeout(context.Background(), time.Second)
+		o, err := e.HTTP.OrderByClient(octx, e.Cfg.AccountIndex, clientIdx)
+		cancel()
+		if err == nil {
+			u, precise := o.CreatedUnix()
+			if !precise || u <= 0 {
+				e.Log.Info("fill lag skipped: whole-second created_at", "window_ts", windowTS, "client_idx", clientIdx)
+				return
+			}
+			created = u
+			break
+		}
+		if !time.Now().Before(deadline) {
+			e.Log.Warn("fill lag unavailable", "window_ts", windowTS, "client_idx", clientIdx, "err", err)
+			return
+		}
+		select {
+		case <-time.After(350 * time.Millisecond):
+		}
+	}
+	lagMS := math.Round((created - float64(windowTS)) * 1000)
+	if lagMS <= 0 {
+		e.Log.Info("fill lag skipped: created_at not after open", "window_ts", windowTS, "client_idx", clientIdx, "created", created)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := e.Store.UpdateWindowFillLag(ctx, windowTS, lagMS, created); err != nil {
+		e.Log.Warn("fill lag book", "err", err, "window_ts", windowTS, "client_idx", clientIdx)
+		return
+	}
+	e.Log.Info("fill lag booked", "window_ts", windowTS, "client_idx", clientIdx, "lag_ms", lagMS)
 }
 
 // venuePreflight checks that Lighter answers before we submit an entry.
