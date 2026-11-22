@@ -3,7 +3,7 @@
 Краткая навигация для ИИ и людей. Детали стратегии — в `docs/`, деплой — в `INSTRUCTIONS.md`.  
 **Обновляй эту карту**, когда меняется структура, ответственность пакетов или критичные потоки.
 
-Последняя актуализация: 2026-11-22 (лаг входа дописывается в фоне из точного created_at; строка exit-ордера пишется отдельно от дедлайна границы).
+Последняя актуализация: 2026-11-22 (плановый выход стартует за 1500 мс до границы).
 
 ---
 
@@ -73,7 +73,7 @@ main.go
        → MarketIOC entry (deadline EntryMaxLag)
        → if submit ack lost (timeout/reset): reconcile, do not assume reject
        → confirm fill + optional stop-loss
-       → hold → exit / detect remote close / flatten
+       → hold → exit starts 1500ms before the boundary / detect remote close / flatten
        → settle: one reduce; on the boundary, no pre-close tape and cancel+IOC deadline leaves T+2 for decide; the exit order row is written on its own short context; exit px/PnL only from the tape (refine async)
        → decide refreshes a stale equity/price snapshot once inside the entry budget; fill lag is a sub-second created_at written asynchronously after the stop
        → shadow binance (shadow columns only)

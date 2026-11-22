@@ -327,14 +327,14 @@ ts+0..200ms  sanity + side
 ts+2s    если ордер не sent/не fill → cancel, skip, NEVER chase later in the window
          после fill: place reduce-only stop at fill ± 0.125%
          if stop fills: flatten done, stay FLAT until next window (no re-entry)
-ts+300-250ms  если ещё в позиции: cancel stop, begin flatten
+ts+300-1500ms если ещё в позиции: cancel stop, begin flatten
 ts+300   must be flat. if not: emergency market close, alert `exit_late`
 ts+300+  next window is a NEW decision; не переносить сторону
 ```
 
 **Не держать позицию через границу.** Окно N+1 имеет свой гейт. Если в N были LONG, а в N+1 skip — мы уже flat. Если в N+1 снова LONG — открыть заново (даже если «логически та же сторона»): это новая сделка, новый сайз от новой equity.
 
-Практический выход чуть **раньше** `:00` (200–300 ms), чтобы не столкнуться с входом следующего окна. Research close = Binance 5m close, который совпадает с границей. Смещение выхода на 300 ms для 5m — шум vs опоздание входа на 5 с.
+Практический выход начинается за **1500 ms** до `:00`, чтобы закрытие успело подтвердить flat до колокола и не столкнуться с входом следующего окна. Research close = Binance 5m close, который совпадает с границей. Сдвиг старта на 1.5 с для 5m — шум против пропуска входа на границе.
 
 ### 6.5 PnL
 
@@ -414,7 +414,7 @@ HALT
 TH = 0.65
 MAX_ENTRY_LAG_S = 2.0
 PREWARM_S = 15.0
-EXIT_EARLY_S = 0.30
+EXIT_EARLY_S = 1.5
 LEVERAGE = 1.0
 MAX_SPREAD = 0.05
 STOP_PRICE_PCT = 0.00125   # 0.125% of BTC fill; do NOT * leverage
@@ -644,7 +644,7 @@ PM_THRESHOLD=0.65
 PM_MAX_SPREAD=0.05
 PM_PREWARM_SECONDS=15
 ENTRY_MAX_LAG_SECONDS=2.0
-EXIT_EARLY_SECONDS=0.30
+EXIT_EARLY_SECONDS=1.5
 STOP_PRICE_PCT=0.00125
 LIGHTER_SYMBOL=BTC
 LIGHTER_LEVERAGE=1

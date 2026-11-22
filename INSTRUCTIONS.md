@@ -210,10 +210,12 @@ PM_THRESHOLD=0.65
 PM_MAX_SPREAD=0.05
 PM_PREWARM_SECONDS=15
 ENTRY_MAX_LAG_SECONDS=2.0
-EXIT_EARLY_SECONDS=0.30
+EXIT_EARLY_SECONDS=1.5
 STOP_PRICE_PCT=0.00125
 SHADOW_BINANCE_1S=true
 ```
+
+`EXIT_EARLY_SECONDS=1.5` — плановый выход стартует за 1.5 с до `:00`. На VPS в `.env` должно стоять то же значение: `0.30` бот больше не примет.
 
 `STOP_PRICE_PCT` задаётся десятичной долей цены: `0.00125` = `0.125%`. Если меняешь это значение, пересчитай его в соответствии со своим профилем; не умножай на плечо. Бот остановится при `STOP_PRICE_PCT=0`.
 

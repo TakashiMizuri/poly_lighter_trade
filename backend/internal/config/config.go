@@ -81,7 +81,7 @@ func Load() (*Config, error) {
 		MaxSpread:             getenvFloat("PM_MAX_SPREAD", 0.05),
 		PrewarmSeconds:        getenvFloat("PM_PREWARM_SECONDS", 15),
 		EntryMaxLag:           time.Duration(getenvFloat("ENTRY_MAX_LAG_SECONDS", 2.0) * float64(time.Second)),
-		ExitEarly:             time.Duration(getenvFloat("EXIT_EARLY_SECONDS", 0.30) * float64(time.Second)),
+		ExitEarly:             time.Duration(getenvFloat("EXIT_EARLY_SECONDS", 1.5) * float64(time.Second)),
 		Leverage:              getenvFloat("LIGHTER_LEVERAGE", 1),
 		EquityFraction:        getenvFloat("LIGHTER_EQUITY_FRACTION", 1.0),
 		MarketSlippage:        getenvFloat("MARKET_SLIPPAGE", 0.02),
@@ -161,8 +161,8 @@ func Load() (*Config, error) {
 	if cfg.EntryMaxLag <= 0 || cfg.EntryMaxLag > 2*time.Second {
 		return nil, fmt.Errorf("ENTRY_MAX_LAG_SECONDS must be in (0, 2] for POLY_LIGHTER_1")
 	}
-	if cfg.ExitEarly <= 0 || cfg.ExitEarly > 2*time.Second {
-		return nil, fmt.Errorf("EXIT_EARLY_SECONDS must be in (0, 2]")
+	if math.Abs(cfg.ExitEarly.Seconds()-1.5) > 1e-9 {
+		return nil, fmt.Errorf("POLY_LIGHTER_1 requires EXIT_EARLY_SECONDS=1.5")
 	}
 	if !finite(cfg.StopPricePct) || cfg.StopPricePct <= 0 || cfg.StopPricePct > 0.05 {
 		return nil, fmt.Errorf("STOP_PRICE_PCT must be in (0, 0.05] (default 0.00125 = 0.125%% of BTC price)")

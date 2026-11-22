@@ -2,6 +2,7 @@ package config
 
 import (
 	"testing"
+	"time"
 )
 
 func TestEventSlug(t *testing.T) {
@@ -25,6 +26,21 @@ func TestStrategyProfileDefaultsAllowed(t *testing.T) {
 	}
 	if cfg.Leverage != 1 {
 		t.Fatalf("got %v", cfg.Leverage)
+	}
+	if cfg.ExitEarly != 1500*time.Millisecond {
+		t.Fatalf("exit early %s", cfg.ExitEarly)
+	}
+}
+
+func TestExitEarlyRejectsOld300ms(t *testing.T) {
+	t.Setenv("DASHBOARD_PASSWORD", "x")
+	t.Setenv("LIGHTER_API_KEY_INDEX", "4")
+	t.Setenv("LIGHTER_NETWORK", "mainnet")
+	t.Setenv("LIGHTER_LEVERAGE", "1")
+	t.Setenv("DRY_RUN", "true")
+	t.Setenv("EXIT_EARLY_SECONDS", "0.30")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected reject of 0.30")
 	}
 }
 

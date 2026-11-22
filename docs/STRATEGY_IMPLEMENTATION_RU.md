@@ -56,7 +56,7 @@
 | Сайз | `qty = floor_lot(equity / px)`, leverage **1**, fraction **1.0** |
 | Стоп | `STOP_PRICE_PCT=0.00125` от **fill**; LONG `fill×0.99875`, SHORT `fill×1.00125` |
 | Выход A | стоп → flatten сразу, `exit_reason=sl` |
-| Выход B | иначе flatten на `ts+300 − EXIT_EARLY` (~0.3s) |
+| Выход B | иначе flatten на `ts+300 − EXIT_EARLY` (1.5s до границы) |
 | После стопа | **нет** re-entry в том же окне |
 | Рестарт mid-window | **не** входить; только следующая граница |
 | Рестарт с позицией | немедленный reduce-only flatten |
@@ -217,7 +217,7 @@ ts + 0..200ms         при LONG/SHORT → MarketIOC (deadline ts+EntryMaxLag)
 после send            confirmLiveFill (до ~5s): trades VWAP и/или account position
 после fill            StopLoss reduce-only на fill ± 0.125%
 hold                  tick ~1s: detectExit / age halt / exitAt
-ts+300-ExitEarly      settleWindow: cancel stop → market close
+ts+300-1.5s           settleWindow: cancel stop → market close
 ts+300                must be flat; иначе exit_late (+ streak → HALT)
 после settle          shadow Binance async; waitNextOpen(next)
 ```
@@ -274,7 +274,7 @@ ts+300                must be flat; иначе exit_late (+ streak → HALT)
 - `detectExit`: grace 2s после `ArmedAt`; `SeenAcctOpen` выставляется при первом confirmed open; flat без ever-open допускается только после age≥5s (DNS мог скрыть open). Flat → VWAP closing fills → `stop` / `closed_away`.
 - `resolveStopWatchdog` (live): last/mark `StopHit` → poll account ~350ms. Flat → settle remote (tape VWAP, без market close). Open → settle residual (CancelAll + market). Unknown → settle keep-stop (market **без** CancelAll, чтобы не убить live SL). Grace 2s.
 - Age &gt; `HaltPositionMax` (default 6m) → halt + settle `halt_age`.
-- `now ≥ ts+300−ExitEarly` → settle window close.
+- `now ≥ ts+300−1.5s` → settle window close.
 - Prewarm следующего окна, если позиция ещё жива.
 
 ### 5.7 EXIT / SETTLE (`settleWindow` → `finalizePosition`)
@@ -423,7 +423,7 @@ bootWindow mid-window ──► ждать следующего open (не до�
 | `PM_MAX_SPREAD` | 0.05 | max BBO spread |
 | `PM_PREWARM_SECONDS` | 15 | prewarm |
 | `ENTRY_MAX_LAG_SECONDS` | 2.0 | hard deadline входа |
-| `EXIT_EARLY_SECONDS` | 0.30 | flatten до границы |
+| `EXIT_EARLY_SECONDS` | 1.5 | старт flatten за 1.5 с до границы |
 | `STOP_PRICE_PCT` | 0.00125 | 0.125% цены BTC |
 | `MARKET_SLIPPAGE` | 0.02 | IOC price guard ±2% |
 | `LIGHTER_LEVERAGE` | 1 | locked |
