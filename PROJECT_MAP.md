@@ -108,6 +108,8 @@ main.go
 | Файл | Роль |
 |------|------|
 | `frontend/src/Dashboard.tsx` | Статус, окна, skip reasons (в т.ч. `order_failed` → «ордер не ушёл») |
+| `frontend/src/TimingTimeline.tsx` | Таймлайн окна вокруг `:00`; кнопка «Гант» раскрывает пропорциональные полосы, `:00` — вертикальная линия |
+| `frontend/src/timeline.ts` | Сборка точек из `WindowTimings` (смещения от `:00` и длительности шагов) |
 | `frontend/src/api.ts` | Fetch API |
 | `frontend/src/Login.tsx` | Пароль дашборда |
 | `frontend/src/components/ui/*` | shadcn-подобные примитивы |

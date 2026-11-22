@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { LogOutIcon } from "lucide-react";
-import { Line, LineChart, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis } from "recharts";
+import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis } from "recharts";
 import {
   EventRow,
   EquityPoint,
@@ -9,15 +9,15 @@ import {
   Stats,
   Status,
   WindowRow,
-  WindowTimings,
   api,
   num,
 } from "./api";
+import { TimingsView } from "./TimingTimeline";
 import { exitLabel, skipLabel } from "./labels";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -57,96 +57,126 @@ function tradeLag(w: WindowRow): number | null {
   return num(w.fill_lag_ms);
 }
 
-const TIMING_STEPS: { key: keyof WindowTimings; label: string }[] = [
-  { key: "ms_late_start", label: "опоздание к :00" },
-  { key: "ms_quote", label: "1. цена PM" },
-  { key: "ms_send", label: "2. отправка IOC" },
-  { key: "ms_open_to_send", label: "начало запроса от :00" },
-  { key: "ms_open_to_send_ack", label: "ответ sendTx от :00" },
-  { key: "ms_fill_wait", label: "fill" },
-  { key: "ms_order_get", label: "timestamp ордера" },
-  { key: "ms_arm", label: "resolve рынка PM" },
-  { key: "ms_ready", label: "equity/цена Lighter" },
-  { key: "ms_warm_book", label: "прогрев стакана" },
-  { key: "ms_nonce", label: "nonce" },
-  { key: "ms_has_window", label: "sqlite" },
-  { key: "ms_equity", label: "equity fallback" },
-  { key: "ms_pos_check", label: "позиция" },
-  { key: "ms_stop", label: "стоп" },
-  { key: "ms_sqlite", label: "запись sqlite" },
-];
-
-function timingVal(t: WindowTimings | null | undefined, k: keyof WindowTimings): number | null {
-  if (!t) return null;
-  const v = t[k];
-  return typeof v === "number" && v > 0 ? v : null;
-}
-
-function TimingsView({ t, compact }: { t?: WindowTimings | null; compact?: boolean }) {
-  if (!t) return <span className="text-muted-foreground">—</span>;
-  const rows = TIMING_STEPS.map((s) => ({ ...s, v: timingVal(t, s.key) })).filter((s) => s.v != null);
-  if (rows.length === 0 && !t.ms_open_to_decide && !t.ms_open_to_exchange) {
-    return <span className="text-muted-foreground">—</span>;
-  }
-  if (compact) {
-    const milestones: { label: string; value: number | null | undefined }[] = [
-      { label: "quote", value: t.ms_open_to_quote },
-      { label: "решение", value: t.ms_open_to_decide },
-      { label: "send", value: t.ms_open_to_send },
-      { label: "ответ", value: t.ms_open_to_send_ack },
-    ];
-    return (
-      <div className="min-w-0 space-y-1 whitespace-normal">
-        <div className="flex flex-wrap gap-1">
-          {milestones.filter((x) => typeof x.value === "number" && x.value > 0).map((x) => (
-            <span key={x.label} className="whitespace-nowrap rounded bg-muted px-1.5 py-0.5 text-[10px] leading-tight">
-              {x.label} <b>{x.value!.toFixed(0)}</b>
-            </span>
-          ))}
-          {t.ms_open_to_exchange ? (
-            <span className="whitespace-nowrap rounded bg-primary/10 px-1.5 py-0.5 text-[10px] leading-tight">
-              ордер <b>{t.ms_open_to_exchange.toFixed(0)}</b>
-            </span>
-          ) : null}
-        </div>
-        {rows.length > 0 ? (
-          <details className="text-[10px] text-muted-foreground">
-            <summary className="cursor-pointer select-none">все этапы ({rows.length})</summary>
-            <ul className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5">
-              {rows.map((s) => (
-                <li key={s.key} className="flex justify-between gap-2">
-                  <span>{s.label}</span>
-                  <span className="tabular-nums">{s.v!.toFixed(0)}</span>
-                </li>
-              ))}
-            </ul>
-          </details>
-        ) : null}
-      </div>
-    );
-  }
-  return (
-    <ul className="space-y-1 text-sm">
-      {t.ms_open_to_exchange ? (
-        <li className="flex justify-between gap-3 font-medium">
-          <span>лаг :00 → created_at ордера</span>
-          <span>{t.ms_open_to_exchange.toFixed(0)} ms</span>
-        </li>
-      ) : null}
-      {rows.map((s) => (
-        <li key={s.key} className="flex justify-between gap-3 text-muted-foreground">
-          <span>{s.label}</span>
-          <span>{s.v!.toFixed(0)} ms</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
 function sideBadge(side: string) {
   if (side === "long") return <Badge>LONG</Badge>;
   if (side === "short") return <Badge variant="outline">SHORT</Badge>;
   return <Badge variant="secondary">skip</Badge>;
+}
+
+type CurveRow = { ts: number; live: number | null; shadow: number | null };
+
+function equityCurve(points: EquityPoint[]): CurveRow[] {
+  const sorted = points.filter((p) => p.ts > 0).sort((a, b) => a.ts - b.ts);
+  let live: number | null = null;
+  let shadow: number | null = null;
+  const out: CurveRow[] = [];
+  for (const p of sorted) {
+    if (p.live > 0) live = p.live;
+    if (p.shadow > 0) shadow = p.shadow;
+    if (live == null && shadow == null) continue;
+    out.push({ ts: p.ts, live, shadow });
+  }
+  return out;
+}
+
+function yDomain(values: number[]): [number, number] {
+  if (values.length === 0) return [0, 1];
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min;
+  const pad = span > 0 ? span * 0.16 : Math.max(Math.abs(max) * 0.01, 1);
+  return [min - pad, max + pad];
+}
+
+const axisTick = { fontSize: 11, fill: "currentColor" };
+
+function ChartTip({
+  active,
+  payload,
+  label,
+  money,
+}: {
+  active?: boolean;
+  payload?: ReadonlyArray<{ name?: string; value?: unknown; color?: string }>;
+  label?: unknown;
+  money?: boolean;
+}) {
+  if (!active || !payload?.length) return null;
+  const rows = payload.flatMap((p) => {
+    const n = typeof p.value === "number" ? p.value : Number(p.value);
+    if (!Number.isFinite(n)) return [];
+    return [{ name: p.name || "", n, color: p.color }];
+  });
+  if (rows.length === 0) return null;
+  return (
+    <div className="rounded-md bg-popover px-2.5 py-1.5 text-xs ring-1 ring-foreground/10">
+      <div className="mb-1 text-muted-foreground">{utc(Number(label))}</div>
+      {rows.map((p) => (
+        <div key={p.name} className="flex items-center gap-2 tabular-nums">
+          <span className="h-1.5 w-1.5 rounded-full" style={{ background: p.color || "currentColor" }} />
+          <span className="text-muted-foreground">{p.name}</span>
+          <span className="text-foreground">{money ? `$${fmt(p.n)}` : `${fmt(p.n, 0)} мс`}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function EquityChart({ points }: { points: EquityPoint[] }) {
+  const data = equityCurve(points);
+  const values = data.flatMap((r) => [r.live, r.shadow].filter((v): v is number => v != null));
+  return (
+    <section>
+      <div className="mb-2 flex items-center gap-4 text-[11px] text-muted-foreground">
+        <span className="text-foreground">Equity</span>
+        <span className="inline-flex items-center gap-1.5">
+          <i className="h-px w-3 bg-foreground" /> Lighter
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <i className="h-px w-3 bg-foreground/35" /> тень
+        </span>
+      </div>
+      {data.length < 2 ? (
+        <p className="text-sm text-muted-foreground">Кривая появится после пары окон</p>
+      ) : (
+        <div className="h-56 text-muted-foreground">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+              <CartesianGrid vertical={false} stroke="currentColor" strokeOpacity={0.12} />
+              <XAxis dataKey="ts" tickFormatter={(v) => hhmm(Number(v))} minTickGap={32} tick={axisTick} tickLine={false} axisLine={false} />
+              <YAxis domain={yDomain(values)} width={48} tickFormatter={(v) => fmt(Number(v), 0)} tick={axisTick} tickLine={false} axisLine={false} />
+              <RTooltip content={<ChartTip money />} />
+              <Line type="linear" dataKey="live" name="Lighter" stroke="var(--color-foreground)" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} />
+              <Line type="linear" dataKey="shadow" name="тень" stroke="var(--color-foreground)" strokeOpacity={0.35} strokeWidth={1.25} dot={false} connectNulls isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function LagChart({ series }: { series: { ts: number; lag: number }[] }) {
+  return (
+    <section>
+      <div className="mb-2 text-[11px] text-muted-foreground">Лаг входов, мс</div>
+      {series.length < 2 ? (
+        <p className="text-sm text-muted-foreground">Нужны две сделки с временем ордера</p>
+      ) : (
+        <div className="h-40 text-muted-foreground">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={series} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+              <CartesianGrid vertical={false} stroke="currentColor" strokeOpacity={0.12} />
+              <XAxis dataKey="ts" tickFormatter={(v) => hhmm(Number(v))} minTickGap={28} tick={axisTick} tickLine={false} axisLine={false} />
+              <YAxis domain={yDomain(series.map((p) => p.lag))} width={40} tickFormatter={(v) => fmt(Number(v), 0)} tick={axisTick} tickLine={false} axisLine={false} />
+              <RTooltip content={<ChartTip />} />
+              <Line type="linear" dataKey="lag" name="лаг" stroke="var(--color-foreground)" strokeWidth={1.5} dot={{ r: 2, strokeWidth: 0, fill: "var(--color-foreground)" }} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </section>
+  );
 }
 
 function pnlClass(n: number | null) {
@@ -293,7 +323,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
         </div>
       ) : (
         <Tabs value={tab} onValueChange={setTab} className="flex-1">
-          <TabsList className="mx-4 mt-3 grid w-auto grid-cols-6">
+          <TabsList className="mx-4 mt-4 w-fit">
             <TabsTrigger value="overview">Обзор</TabsTrigger>
             <TabsTrigger value="trades">Сделки</TabsTrigger>
             <TabsTrigger value="windows">Окна</TabsTrigger>
@@ -302,219 +332,130 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
             <TabsTrigger value="health">Журнал</TabsTrigger>
           </TabsList>
 
-          <TabsContent value="overview" className="space-y-3 p-4">
-            <div className="grid gap-3 lg:grid-cols-3">
-              <Card>
-                <CardHeader className="pb-1">
-                  <CardTitle className="text-xs font-normal text-muted-foreground">Текущее 5m окно UTC</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-1">
-                  <div className="text-lg font-medium">{utc(status.window_ts)}</div>
-                  <p className="text-xs text-muted-foreground">
-                    {fmt(status.secs_into_window, 0)} с от open · до close {fmt(status.secs_to_close, 0)} с
-                  </p>
-                  <p className="text-xs">
-                    Позиция Lighter: <b>{status.position}</b>
-                    {status.entry_px ? ` @ ${fmt(status.entry_px)}` : ""}
-                    {status.stop_px ? ` · стоп ${fmt(status.stop_px)}` : ""}
-                  </p>
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader className="pb-1">
-                  <CardTitle className="text-xs font-normal text-muted-foreground">Сигнал Polymarket (не торгуем здесь)</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-1">
-                  <div className="text-lg font-medium">
-                    Up {fmt(status.p_up, 3)} · Down {fmt(status.p_down, 3)}
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    {signal} · порог {fmt(th, 2)} · спред {fmt(status.spread, 3)} · {status.quote_source || "нет котировки"} · age{" "}
-                    {fmt(status.quote_age_ms, 0)} ms
-                  </p>
-                  <p className="text-xs text-muted-foreground">Последний skip: {status.last_skip ? skipLabel(status.last_skip, th) : "—"}</p>
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader className="pb-1">
-                  <CardTitle className="text-xs font-normal text-muted-foreground">Лаг :00 → создание ордера</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-1">
-                  <div className="text-lg font-medium">{stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"}</div>
-                  <p className="text-xs text-muted-foreground">
-                    Среднее по {stats?.n_fill_lag ?? 0} входам. Skip без ордера не входят.
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    p50 {ms(stats?.p50_fill_lag_ms)} · p90 {ms(stats?.p90_fill_lag_ms)}. Формула одна: дата создания
-                    ордера на Lighter минус :00 окна UTC. Skip без ордера — не лаг.
-                  </p>
-                </CardContent>
-              </Card>
+          <TabsContent value="overview" className="space-y-8 p-4">
+            <div className="grid gap-6 sm:grid-cols-3">
+              <div>
+                <div className="text-[11px] text-muted-foreground">Окно</div>
+                <div className="mt-1 text-base font-medium tabular-nums">{hhmm(status.window_ts)}</div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {fmt(status.secs_into_window, 0)} с от :00 · до конца {fmt(status.secs_to_close, 0)} с
+                </div>
+                <div className="mt-0.5 text-xs">
+                  {status.position}
+                  {status.entry_px ? ` @ ${fmt(status.entry_px)}` : ""}
+                  {status.stop_px ? ` · стоп ${fmt(status.stop_px)}` : ""}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-muted-foreground">Polymarket</div>
+                <div className="mt-1 text-base font-medium tabular-nums">
+                  {fmt(status.p_up, 3)} <span className="font-normal text-muted-foreground">/</span> {fmt(status.p_down, 3)}
+                </div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {signal} · спред {fmt(status.spread, 3)} · {status.quote_source || "нет книги"}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-muted-foreground">Лаг входа</div>
+                <div className="mt-1 text-base font-medium tabular-nums">{stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"}</div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  p50 {ms(stats?.p50_fill_lag_ms)} · p90 {ms(stats?.p90_fill_lag_ms)} · n {stats?.n_fill_lag ?? 0}
+                </div>
+              </div>
             </div>
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">Последнее окно — из чего сложилось время</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <TimingsView t={windows[0]?.timings || status.last_timings} />
-              </CardContent>
-            </Card>
 
-            <ForecastCard forecast={stats?.forecast} liveEquity={status.equity} />
+            <section>
+              <div className="mb-2 text-[11px] text-muted-foreground">Последнее окно</div>
+              <TimingsView t={windows[0]?.timings || status.last_timings} />
+            </section>
 
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Stat label="Equity Lighter" value={`$${fmt(status.equity)}`} hint="Живой счёт" />
-              <Stat label="Пик / тень Binance" value={`$${fmt(status.peak_equity)} / $${fmt(status.shadow_equity)}`} hint="Тень — research T+1s, не Lighter" />
-              <Stat label="Сделки / skip" value={`${stats?.n_trades ?? 0} / ${stats?.n_skip ?? 0}`} hint={`окон ${stats?.n_windows ?? 0} · валидная котировка ≤1с: ${fmt((stats?.coverage ?? 0) * 100, 1)}%`} />
-              <Stat label="WR live" value={`${fmt((stats?.wr ?? 0) * 100, 1)}%`} hint={`mean ${fmt(stats?.mean_bps, 1)} bps · SL ${stats?.n_sl ?? 0}`} />
-              <Stat label="Тень mean bps" value={fmt(stats?.shadow_mean_bps, 1)} hint="Binance 1s T+1 → 5m close" />
-              <Stat label="gap live − тень" value={fmt(stats?.gap_bps, 1)} hint={stats?.match_coef == null ? "мало пар" : `live/тень ${fmt(stats.match_coef, 2)}`} />
-              <Stat
+            <EquityChart points={equity} />
+
+            <div className="grid items-start gap-8 lg:grid-cols-2">
+              <ForecastCard forecast={stats?.forecast} liveEquity={status.equity} />
+              <LagChart series={lagSeries} />
+            </div>
+
+            <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3">
+              <Metric label="Equity" value={`$${fmt(status.equity)}`} sub={`пик $${fmt(status.peak_equity)}`} />
+              <Metric label="WR" value={`${fmt((stats?.wr ?? 0) * 100, 1)}%`} sub={`mean ${fmt(stats?.mean_bps, 1)} bps · SL ${stats?.n_sl ?? 0}`} />
+              <Metric label="Сделки" value={`${stats?.n_trades ?? 0}`} sub={`skip ${stats?.n_skip ?? 0} · окон ${stats?.n_windows ?? 0}`} />
+              <Metric label="Тень" value={`${fmt(stats?.shadow_mean_bps, 1)} bps`} sub={`зазор ${fmt(stats?.gap_bps, 1)}`} />
+              <Metric
                 label="Последний вход"
-                value={lastTrade ? `${lastTrade.side.toUpperCase()} ${ms(tradeLag(lastTrade))}` : "пока нет"}
-                hint={lastTrade ? `${utc(lastTrade.window_ts)} · ${fmt(num(lastTrade.lighter_entry_px), 1)}` : "лаг появится после первой сделки"}
+                value={lastTrade ? `${lastTrade.side} ${ms(tradeLag(lastTrade))}` : "—"}
+                sub={lastTrade ? hhmm(lastTrade.window_ts) : undefined}
               />
-              <Stat label="Стоп" value={`${fmt(status.stop_price_pct * 100, 3)}% цены BTC`} hint="Reduce-only, не % депозита" />
+              <Metric label="Покрытие" value={`${fmt((stats?.coverage ?? 0) * 100, 0)}%`} sub="котировка не старше 1 с" />
             </div>
 
-            <div className="grid gap-3 lg:grid-cols-2">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">Equity live vs тень Binance</CardTitle>
-                </CardHeader>
-                <CardContent className="h-48">
-                  {equity.length < 2 ? (
-                    <div className="text-sm text-muted-foreground">Мало точек — кривая появится после окон</div>
-                  ) : (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={equity}>
-                        <XAxis dataKey="ts" hide />
-                        <YAxis domain={["auto", "auto"]} width={48} />
-                        <RTooltip />
-                        <Line type="monotone" dataKey="live" stroke="#111" dot={false} strokeWidth={1.5} name="Lighter" />
-                        <Line type="monotone" dataKey="shadow" stroke="#888" dot={false} strokeWidth={1} name="тень" />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  )}
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">Лаг входов, ms (только сделки)</CardTitle>
-                </CardHeader>
-                <CardContent className="h-48">
-                  {lagSeries.length < 2 ? (
-                    <div className="text-sm text-muted-foreground">Нужны минимум две сделки с timestamp ордера</div>
-                  ) : (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={lagSeries}>
-                        <XAxis dataKey="ts" tickFormatter={(v) => hhmm(Number(v))} minTickGap={24} />
-                        <YAxis domain={["auto", "auto"]} width={40} />
-                        <RTooltip formatter={(v) => [`${Number(v).toFixed(0)} ms`, "лаг"]} labelFormatter={(l) => utc(Number(l))} />
-                        <Line type="monotone" dataKey="lag" stroke="#111" dot={false} strokeWidth={1.5} />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  )}
-                </CardContent>
-              </Card>
-            </div>
-
-            <div className="grid gap-3 lg:grid-cols-2">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">Почему skip</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  {skipMix.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">Пока нет пропусков</p>
-                  ) : (
-                    <ul className="space-y-1 text-sm">
-                      {skipMix.map(([k, n]) => (
-                        <li key={k} className="flex justify-between gap-3">
-                          <span>{skipLabel(k, th)}</span>
-                          <span className="text-muted-foreground">{n}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">Последние окна</CardTitle>
-                </CardHeader>
-                <CardContent className="overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>open</TableHead>
-                        <TableHead>сторона</TableHead>
-                        <TableHead>p_up</TableHead>
-                        <TableHead>лаг</TableHead>
-                        <TableHead>этапы, ms</TableHead>
-                        <TableHead>итог</TableHead>
+            <div className="grid gap-8 lg:grid-cols-2">
+              <section>
+                <div className="mb-2 text-[11px] text-muted-foreground">Почему skip</div>
+                {skipMix.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">Пока нет</p>
+                ) : (
+                  <ul className="space-y-1 text-sm">
+                    {skipMix.map(([k, n]) => (
+                      <li key={k} className="flex justify-between gap-3">
+                        <span>{skipLabel(k, th)}</span>
+                        <span className="tabular-nums text-muted-foreground">{n}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+              <section>
+                <div className="mb-2 text-[11px] text-muted-foreground">Последние окна</div>
+                <Table>
+                  <TableBody>
+                    {windows.slice(0, 6).map((w) => (
+                      <TableRow key={w.window_ts}>
+                        <TableCell className="text-xs tabular-nums">{hhmm(w.window_ts)}</TableCell>
+                        <TableCell>{sideBadge(w.side)}</TableCell>
+                        <TableCell className="text-xs tabular-nums">{fmt(w.p_up, 3)}</TableCell>
+                        <TableCell className={`text-xs ${pnlClass(num(w.pnl_usd))}`}>
+                          {isTrade(w) ? (num(w.pnl_usd) != null ? `$${fmt(num(w.pnl_usd), 2)}` : exitLabel(w.exit_reason) || "open") : skipLabel(w.skip_reason, th)}
+                        </TableCell>
                       </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {windows.slice(0, 8).map((w) => (
-                        <TableRow key={w.window_ts}>
-                          <TableCell className="text-xs">{hhmm(w.window_ts)}</TableCell>
-                          <TableCell>{sideBadge(w.side)}</TableCell>
-                          <TableCell>{fmt(w.p_up, 3)}</TableCell>
-                          <TableCell>{ms(tradeLag(w))}</TableCell>
-                          <TableCell className="max-w-[18rem] whitespace-normal">
-                            <TimingsView t={w.timings} compact />
-                          </TableCell>
-                          <TableCell className={`text-xs ${pnlClass(num(w.pnl_usd))}`}>
-                            {isTrade(w) ? (num(w.pnl_usd) != null ? `$${fmt(num(w.pnl_usd), 2)}` : exitLabel(w.exit_reason) || "open") : skipLabel(w.skip_reason, th)}
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </CardContent>
-              </Card>
+                    ))}
+                  </TableBody>
+                </Table>
+              </section>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <Button variant="destructive" disabled={busy} onClick={() => void kill()}>
+            <div className="flex gap-2">
+              <Button variant="destructive" size="sm" disabled={busy} onClick={() => void kill()}>
                 Kill / flatten
               </Button>
-              <Button variant="outline" disabled={busy} onClick={() => void resume()}>
+              <Button variant="outline" size="sm" disabled={busy} onClick={() => void resume()}>
                 Resume
               </Button>
-              <span className="text-xs text-muted-foreground">
-                PM = сигнал, Lighter = сделки, Binance = время для справки и research-тень.
-              </span>
             </div>
           </TabsContent>
 
           <TabsContent value="trades" className="space-y-3 p-4">
-            <p className="text-xs text-muted-foreground">
-              Только входы. Лаг = created_at ордера на Lighter − :00 UTC. Ничего больше в лаг не входит.
-            </p>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Stat label="Средний лаг" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} />
-              <Stat label="p50 / p90" value={`${ms(stats?.p50_fill_lag_ms)} / ${ms(stats?.p90_fill_lag_ms)}`} />
-              <Stat label="n с лагом" value={String(stats?.n_fill_lag ?? 0)} />
-              <Stat label="WR / mean bps" value={`${fmt((stats?.wr ?? 0) * 100, 1)}% / ${fmt(stats?.mean_bps, 1)}`} />
+            <p className="text-xs text-muted-foreground">Лаг — created_at ордера на Lighter минус :00.</p>
+            <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-4">
+              <Metric label="Средний лаг" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} />
+              <Metric label="p50 / p90" value={`${ms(stats?.p50_fill_lag_ms)} / ${ms(stats?.p90_fill_lag_ms)}`} />
+              <Metric label="С лагом" value={String(stats?.n_fill_lag ?? 0)} />
+              <Metric label="WR" value={`${fmt((stats?.wr ?? 0) * 100, 1)}%`} sub={`mean ${fmt(stats?.mean_bps, 1)} bps`} />
             </div>
             <WindowTable rows={trades} tradesOnly threshold={th} />
           </TabsContent>
 
           <TabsContent value="windows" className="p-4">
-            <p className="mb-2 text-xs text-muted-foreground">
-              Лаг только если ордер создан на бирже. Skip = «—». Колонка «этапы» — диагностика, это не лаг.
-            </p>
+            <p className="mb-3 text-xs text-muted-foreground">Ромб на шкале — :00. Числа над линией — миллисекунды.</p>
             <WindowTable rows={windows} threshold={th} />
           </TabsContent>
 
           <TabsContent value="exec" className="space-y-3 p-4">
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Stat label="Средний лаг входов" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} hint=":00 UTC → created_at ордера Lighter" />
-              <Stat label="p50 / p90 лаг" value={`${ms(stats?.p50_fill_lag_ms)} / ${ms(stats?.p90_fill_lag_ms)}`} />
-              <Stat label="paired live/тень" value={String(stats?.n_paired ?? 0)} />
-              <Stat label="выходы по SL" value={String(stats?.n_sl ?? 0)} />
+            <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-4">
+              <Metric label="Средний лаг" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} />
+              <Metric label="p50 / p90" value={`${ms(stats?.p50_fill_lag_ms)} / ${ms(stats?.p90_fill_lag_ms)}`} />
+              <Metric label="Пары с тенью" value={String(stats?.n_paired ?? 0)} />
+              <Metric label="Выходы по SL" value={String(stats?.n_sl ?? 0)} />
             </div>
             {orders.length === 0 ? (
               <p className="text-sm text-muted-foreground">Ордеров ещё нет</p>
@@ -547,38 +488,22 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
           </TabsContent>
 
           <TabsContent value="clock" className="space-y-3 p-4">
-            <Alert>
-              <AlertTitle>Расписание и дедлайн входа используют системный UTC хоста.</AlertTitle>
-              <AlertDescription>
-                Синхронизацию системных часов обеспечивает chrony/NTP на VPS. Замер Binance — только диагностика:
-                его таймаут или отсутствие свежего значения не блокирует вход. Лаг сделки отдельно считается по created_at ордера Lighter.
-              </AlertDescription>
-            </Alert>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Stat
-                label="диагностический offset Binance − host"
-                value={status.clock_ok ? signedMs(status.clock_offset_ms) : "нет замера"}
-                hint="Плюс = Binance впереди VPS; не управляет входом"
-              />
-              <Stat label="RTT замера" value={ms(status.clock_rtt_ms)} hint=">800 ms — сеть, замер выкидывается" />
-              <Stat label="замер доверенный" value={status.clock_ok ? `да · ${ms(status.clock_age_ms)} назад` : "нет / устарел"} />
-              <Stat label="дедлайн входа" value="T+2.0 с" hint="По системному UTC VPS; после ts+2 — skip late" />
+            <p className="text-xs text-muted-foreground">
+              Дедлайн входа — системный UTC. Замер Binance на него не влияет.
+            </p>
+            <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-4">
+              <Metric label="Binance − host" value={status.clock_ok ? signedMs(status.clock_offset_ms) : "—"} />
+              <Metric label="RTT" value={ms(status.clock_rtt_ms)} />
+              <Metric label="Замер" value={status.clock_ok ? ms(status.clock_age_ms) : "нет"} sub={status.clock_ok ? "назад" : "устарел"} />
+              <Metric label="Дедлайн" value="T+2 с" />
             </div>
           </TabsContent>
 
           <TabsContent value="health" className="space-y-3 p-4">
-            <Alert variant={halted ? "destructive" : "default"}>
-              <AlertTitle>{halted ? "HALT" : "OK"}</AlertTitle>
-              <AlertDescription>
-                kill={String(status.kill_switch)} · halt={status.halt_reason || "—"} · {status.state} · uptime{" "}
-                {fmt(status.uptime_sec / 60, 1)} мин · dry={String(status.dry_run)}
-              </AlertDescription>
-            </Alert>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              <Stat label="symbol" value={status.symbol} />
-              <Stat label="порог PM" value={fmt(status.threshold, 2)} />
-              <Stat label="leverage × fraction" value={`${fmt(status.leverage, 1)} × ${fmt(status.equity_fraction, 2)}`} />
-            </div>
+            <p className="text-sm">
+              {halted ? `HALT${status.halt_reason ? ` · ${status.halt_reason}` : ""}` : status.state}
+              <span className="text-muted-foreground"> · {fmt(status.uptime_sec / 60, 0)} мин · порог {fmt(status.threshold, 2)}</span>
+            </p>
             <Table>
               <TableHeader>
                 <TableRow>
@@ -606,17 +531,13 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
   );
 }
 
-function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
+function Metric({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
-    <Card>
-      <CardHeader className="pb-1">
-        <CardTitle className="text-xs font-normal text-muted-foreground">{label}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <div className="text-lg font-medium">{value}</div>
-        {hint ? <div className="mt-1 text-[11px] leading-snug text-muted-foreground">{hint}</div> : null}
-      </CardContent>
-    </Card>
+    <div className="min-w-0">
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+      <div className="mt-0.5 truncate text-base font-medium tabular-nums">{value}</div>
+      {sub ? <div className="truncate text-[11px] text-muted-foreground">{sub}</div> : null}
+    </div>
   );
 }
 
@@ -631,35 +552,23 @@ function ForecastCard({ forecast, liveEquity }: { forecast?: Forecast; liveEquit
   const base = liveEquity && liveEquity > 0 ? liveEquity : f?.equity_now;
   const scale = f && f.equity_now > 0 && base && base > 0 ? base / f.equity_now : 1;
   return (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm">Прогноз баланса</CardTitle>
-        <p className="text-xs text-muted-foreground">
-          Модель: equity × (1 + mean_bps/10⁴)^(сделок/день × дни). Частота и mean — по накопленным окнам; после
-          сброса шумит, с ростом выборки стабилизируется.
-        </p>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {!f || !f.ready ? (
-          <p className="text-sm text-muted-foreground">{f?.note || "Нужны закрытые сделки, чтобы строить прогноз."}</p>
-        ) : (
-          <>
-            <div className="grid grid-cols-3 gap-3">
-              <ForecastHorizon label="Неделя" equity={f.equity_1w * scale} retPct={f.ret_1w_pct} />
-              <ForecastHorizon label="Месяц" equity={f.equity_1m * scale} retPct={f.ret_1m_pct} />
-              <ForecastHorizon label="Год" equity={f.equity_1y * scale} retPct={f.ret_1y_pct} />
-            </div>
-            <p className="text-xs text-muted-foreground">
-              База ${fmt(base)} · {f.n_trades} сделок · {fmt(f.trades_per_day, 2)}/день · доля окон{" "}
-              {fmt(f.trade_rate * 100, 1)}% · WR {fmt(f.wr * 100, 1)}% · mean {fmt(f.mean_bps, 1)} bps (
-              {fmt(f.mean_pnl_usd, 3)}$) · выборка {fmt(f.sample_hours, 1)} ч · надёжность {confidenceLabel(f.confidence)}{" "}
-              ({fmt(f.confidence_score * 100, 0)}%)
-            </p>
-            <p className="text-[11px] leading-snug text-muted-foreground">{f.note}</p>
-          </>
-        )}
-      </CardContent>
-    </Card>
+    <section>
+      <div className="mb-2 text-[11px] text-muted-foreground">Прогноз</div>
+      {!f || !f.ready ? (
+        <p className="text-sm text-muted-foreground">{f?.note || "Нужны закрытые сделки"}</p>
+      ) : (
+        <>
+          <div className="grid grid-cols-3 gap-3">
+            <ForecastHorizon label="Неделя" equity={f.equity_1w * scale} retPct={f.ret_1w_pct} />
+            <ForecastHorizon label="Месяц" equity={f.equity_1m * scale} retPct={f.ret_1m_pct} />
+            <ForecastHorizon label="Год" equity={f.equity_1y * scale} retPct={f.ret_1y_pct} />
+          </div>
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            {f.n_trades} сделок · mean {fmt(f.mean_bps, 1)} bps · {confidenceLabel(f.confidence)}
+          </p>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -712,7 +621,7 @@ function WindowTable({ rows, tradesOnly, threshold = 0.65 }: { rows: WindowRow[]
                 {tradesOnly ? <MiniMetric label="SL slip bps" value={fmt(num(w.sl_slip_bps), 1)} /> : null}
               </div>
               <div className="min-w-0 border-t pt-2">
-                <div className="mb-1 text-[10px] font-medium text-muted-foreground">Тайминг</div>
+                <div className="mb-1 text-[10px] font-medium text-muted-foreground">Таймлайн от :00</div>
                 <TimingsView t={w.timings} compact />
               </div>
             </CardContent>
@@ -731,7 +640,7 @@ function WindowTable({ rows, tradesOnly, threshold = 0.65 }: { rows: WindowRow[]
             <TableHead>котировка</TableHead>
             {!tradesOnly ? <TableHead>skip</TableHead> : null}
             <TableHead>лаг :00→ордер</TableHead>
-            <TableHead>этапы, ms</TableHead>
+            <TableHead>таймлайн, мс</TableHead>
             <TableHead>Lighter in</TableHead>
             <TableHead>Lighter out</TableHead>
             <TableHead>стоп</TableHead>
@@ -752,7 +661,7 @@ function WindowTable({ rows, tradesOnly, threshold = 0.65 }: { rows: WindowRow[]
               <TableCell className="text-xs">{w.quote_source || "—"}</TableCell>
               {!tradesOnly ? <TableCell className="text-xs">{w.skip_reason ? skipLabel(w.skip_reason, threshold) : "—"}</TableCell> : null}
               <TableCell>{ms(tradeLag(w))}</TableCell>
-              <TableCell className="max-w-[22rem] min-w-[16rem] whitespace-normal">
+              <TableCell className="max-w-[40rem] min-w-[22rem] whitespace-normal">
                 <TimingsView t={w.timings} compact />
               </TableCell>
               <TableCell className="text-xs">{fmt(num(w.lighter_entry_px), 1)}</TableCell>
