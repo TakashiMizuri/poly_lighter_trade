@@ -161,8 +161,8 @@ func Load() (*Config, error) {
 	if cfg.EntryMaxLag <= 0 || cfg.EntryMaxLag > 2*time.Second {
 		return nil, fmt.Errorf("ENTRY_MAX_LAG_SECONDS must be in (0, 2] for POLY_LIGHTER_1")
 	}
-	if math.Abs(cfg.ExitEarly.Seconds()-1.5) > 1e-9 {
-		return nil, fmt.Errorf("POLY_LIGHTER_1 requires EXIT_EARLY_SECONDS=1.5")
+	if cfg.ExitEarly <= 0 || cfg.ExitEarly > 2*time.Second {
+		return nil, fmt.Errorf("EXIT_EARLY_SECONDS must be in (0, 2]")
 	}
 	if !finite(cfg.StopPricePct) || cfg.StopPricePct <= 0 || cfg.StopPricePct > 0.05 {
 		return nil, fmt.Errorf("STOP_PRICE_PCT must be in (0, 0.05] (default 0.00125 = 0.125%% of BTC price)")

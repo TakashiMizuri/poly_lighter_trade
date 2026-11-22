@@ -32,15 +32,19 @@ func TestStrategyProfileDefaultsAllowed(t *testing.T) {
 	}
 }
 
-func TestExitEarlyRejectsOld300ms(t *testing.T) {
+func TestExitEarlyFromEnv(t *testing.T) {
 	t.Setenv("DASHBOARD_PASSWORD", "x")
 	t.Setenv("LIGHTER_API_KEY_INDEX", "4")
 	t.Setenv("LIGHTER_NETWORK", "mainnet")
 	t.Setenv("LIGHTER_LEVERAGE", "1")
 	t.Setenv("DRY_RUN", "true")
 	t.Setenv("EXIT_EARLY_SECONDS", "0.30")
-	if _, err := Load(); err == nil {
-		t.Fatal("expected reject of 0.30")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ExitEarly != 300*time.Millisecond {
+		t.Fatalf("exit early %s", cfg.ExitEarly)
 	}
 }
 
