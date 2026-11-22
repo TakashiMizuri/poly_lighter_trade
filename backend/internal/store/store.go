@@ -725,7 +725,8 @@ WHERE lighter_entry_px IS NOT NULL AND ret_bps IS NOT NULL AND shadow_ret_bps IS
 	if livePaired.Valid && shadowPaired.Valid {
 		st.GapBps, st.MatchCoef = LiveShadowGap(pairedLiveMean, shadowPaired.Float64)
 	}
-	const tradeLag = `side IN ('long','short') AND lighter_entry_px IS NOT NULL AND fill_lag_ms IS NOT NULL`
+	// fill_lag_ms <= 0 is a whole-second created_at collapsed onto :00, not a measured lag.
+	const tradeLag = `side IN ('long','short') AND lighter_entry_px IS NOT NULL AND fill_lag_ms IS NOT NULL AND fill_lag_ms > 0`
 	st.P50LagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.50)
 	st.P90LagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.90)
 	var meanLag sql.NullFloat64

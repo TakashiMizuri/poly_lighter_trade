@@ -26,6 +26,36 @@ func midWindowTS(t *testing.T) int64 {
 	return base
 }
 
+func TestBoundaryCloseLeavesDecideBudget(t *testing.T) {
+	open := time.Unix(1_795_273_500, 0).UTC()
+	early := open.Add(-300 * time.Millisecond)
+	got := boundaryCloseDeadline(early, open, 2*time.Second)
+	want := open.Add(900 * time.Millisecond)
+	if !got.Equal(want) {
+		t.Fatalf("deadline %s want %s", got, want)
+	}
+	late := open.Add(1500 * time.Millisecond)
+	got = boundaryCloseDeadline(late, open, 2*time.Second)
+	if got.Sub(late) != 800*time.Millisecond {
+		t.Fatalf("past-slot cap %s", got.Sub(late))
+	}
+}
+
+func TestSkipPreCloseTapeOnBoundary(t *testing.T) {
+	if !skipPreCloseTape("", 0, true) {
+		t.Fatal("window close on the boundary must not read the tape first")
+	}
+	if skipPreCloseTape("stop", 0, true) {
+		t.Fatal("stop on the boundary still resolves the tape")
+	}
+	if skipPreCloseTape("", 0, false) {
+		t.Fatal("mid-window missing px still looks at the tape")
+	}
+	if !skipPreCloseTape("", 60_000, false) {
+		t.Fatal("known px does not need a tape read")
+	}
+}
+
 func TestPlanSettleClose(t *testing.T) {
 	flatYes := accountFlat{Known: true, Flat: true}
 	flatNo := accountFlat{Known: true, Flat: false}

@@ -82,11 +82,17 @@ func TestFillLagStatsOnlyTrades(t *testing.T) {
 	if err := st.InsertWindow(ctx, trade); err != nil {
 		t.Fatal(err)
 	}
+	zero := Window{WindowTS: 1600, Side: "long"}
+	zero.LighterEntryPx.Float64, zero.LighterEntryPx.Valid = 60000, true
+	zero.FillLagMS.Float64, zero.FillLagMS.Valid = 0, true
+	if err := st.InsertWindow(ctx, zero); err != nil {
+		t.Fatal(err)
+	}
 	stt, err := st.ComputeStats(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stt.NTrades != 1 || stt.NFillLag != 1 {
+	if stt.NTrades != 2 || stt.NFillLag != 1 {
 		t.Fatalf("trades=%d nlag=%d", stt.NTrades, stt.NFillLag)
 	}
 	if stt.MeanFillLagMS < 349 || stt.MeanFillLagMS > 351 {

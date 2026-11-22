@@ -40,9 +40,18 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 	// Within 2s of (or past) the window boundary: prefer speed over extra account polls.
 	nextSoon := !e.now().Before(deadline.Add(-2 * time.Second))
 
+	workCtx := ctx
+	if nextSoon {
+		// One budget for a stop-tape read and the reduce. A hung call must not
+		// start decide(next) after T+2. Window-close does not read the tape here.
+		var cancel context.CancelFunc
+		workCtx, cancel = context.WithDeadline(ctx, boundaryCloseDeadline(e.now(), deadline, e.Cfg.EntryMaxLag))
+		defer cancel()
+	}
+
 	// Prefer exchange tape over last/mark for stop / remote-close paths.
 	var fromTape bool
-	px, fee, reason, fromTape = e.resolveExitTape(ctx, pos, reason, px, fee, nextSoon)
+	px, fee, reason, fromTape = e.resolveExitTape(workCtx, pos, reason, px, fee, nextSoon)
 
 	flat := accountFlat{}
 	if !nextSoon {
@@ -56,7 +65,7 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 	}
 
 	if plan.CancelAll && e.Signer != nil {
-		if err := e.Signer.CancelAll(ctx); err != nil {
+		if err := e.Signer.CancelAll(workCtx); err != nil {
 			e.Log.Warn("cancel orders during settle", "err", err, "reason", reason, "mode", plan.Mode)
 		} else if e.Store != nil {
 			if err := e.Store.CancelOpenStops(ctx, pos.WindowTS); err != nil {
@@ -70,7 +79,7 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 		} else if plan.Mode == settleCloseKeepStop {
 			e.Log.Warn("flatten without cancel: account flatness unknown after stop", "reason", reason)
 		}
-		cpx, cfee, err := e.sendMarketClose(ctx, pos, fillWait)
+		cpx, cfee, err := e.sendMarketClose(workCtx, pos, fillWait)
 		if err != nil {
 			e.alert(ctx, "error", "flatten", err.Error())
 		}
@@ -294,9 +303,33 @@ func planSettleClose(reason string, flat accountFlat, stopTape bool) settleClose
 	return settleClosePlan{Mode: settleCloseWindow, CancelAll: true, MarketClose: true}
 }
 
+// boundaryCloseDeadline is the latest moment cancel+IOC may run when the next
+// window is about to open. The remainder of EntryMaxLag stays for decide.
+func boundaryCloseDeadline(now, nextOpen time.Time, entryMaxLag time.Duration) time.Time {
+	reserve := 1100 * time.Millisecond
+	// Only shrink the decide reserve when the entry window itself is shorter than ~1.3s.
+	if entryMaxLag <= reserve+200*time.Millisecond {
+		reserve = entryMaxLag / 2
+	}
+	until := nextOpen.Add(entryMaxLag - reserve)
+	if !now.Before(until) {
+		return now.Add(800 * time.Millisecond)
+	}
+	return until
+}
+
+// skipPreCloseTape is true when a trades read would only delay the reduce.
+// On the boundary the exit fill does not exist yet; refineExitAsync books it.
+func skipPreCloseTape(reason string, px float64, nextSoon bool) bool {
+	remote := reason == "stop" || reason == "closed_away"
+	if remote {
+		return false
+	}
+	return px > 0 || nextSoon
+}
+
 func (e *Engine) resolveExitTape(ctx context.Context, pos *livePos, reason string, px, fee float64, nextSoon bool) (float64, float64, string, bool) {
-	wantTape := reason == "stop" || reason == "closed_away" || px <= 0
-	if !wantTape {
+	if skipPreCloseTape(reason, px, nextSoon) {
 		return px, fee, reason, false
 	}
 	if p, q, f, sl := e.closingTradeVWAP(ctx, pos); q > 0 {

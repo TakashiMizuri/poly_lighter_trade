@@ -3,7 +3,7 @@
 Краткая навигация для ИИ и людей. Детали стратегии — в `docs/`, деплой — в `INSTRUCTIONS.md`.  
 **Обновляй эту карту**, когда меняется структура, ответственность пакетов или критичные потоки.
 
-Последняя актуализация: 2026-11-22 (exit fill только с ленты; один in-flight close).
+Последняя актуализация: 2026-11-22 (дедлайн закрытия на границе оставляет T+2; лаг только из точного created_at).
 
 ---
 
@@ -33,7 +33,7 @@ poly_lighter_trade/
 ├── docker-compose.yml
 ├── .env.example
 ├── deploy/                   # Caddyfile (опционально, осторожно с Donchian)
-├── scripts/                  # helpers (offset и т.п.)
+├── scripts/                  # helpers (offset, live_vs_backtest.py)
 ├── backend/
 │   ├── cmd/bot/main.go       # entrypoint процесса
 │   └── internal/
@@ -74,7 +74,8 @@ main.go
        → if submit ack lost (timeout/reset): reconcile, do not assume reject
        → confirm fill + optional stop-loss
        → hold → exit / detect remote close / flatten
-       → settle: one reduce; exit px/PnL only from the tape (refine if the boundary cannot wait)
+       → settle: one reduce; on the boundary, no pre-close tape and cancel+IOC deadline leaves T+2 for decide; exit px/PnL only from the tape (refine async)
+       → decide refreshes a stale equity/price snapshot once inside the entry budget; fill lag is sub-second created_at only
        → shadow binance (shadow columns only)
   ↔ api.Server (dashboard, kill/resume, status)
 ```
@@ -144,6 +145,7 @@ main.go
 | `docs/POLY_LIGHTER_STARTPACK_1.md` | Исторический hold-to-close без стопа |
 | `docs/STRATEGY_IMPLEMENTATION_RU.md` | Алгоритм и сценарии как в коде |
 | `BOTS_CLOCK_AND_LAG_CONTEXT.md` | Разбор часов/лага двух ботов (контекст) |
+| `scripts/live_vs_backtest.py` | Live-сделки дашборда vs канон T+1 / SL 0.125% на наших `p_up`. Правило для ИИ — в `AGENTS.md` |
 
 ---
 

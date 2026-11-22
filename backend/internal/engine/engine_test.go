@@ -13,19 +13,19 @@ import (
 
 func testConfig() *config.Config {
 	return &config.Config{
-		Profile:        "POLY_LIGHTER_1",
-		Symbol:         "BTC",
-		Threshold:      0.65,
-		MaxSpread:      0.05,
-		PrewarmSeconds: 15,
-		EntryMaxLag:    2 * time.Second,
-		ExitEarly:      300 * time.Millisecond,
-		Leverage:       1,
-		EquityFraction: 1,
-		MarketSlippage: 0.02,
-		StopPricePct:   0.00125,
-		DryRun:         true,
-		HaltDDpct:      0.08,
+		Profile:            "POLY_LIGHTER_1",
+		Symbol:             "BTC",
+		Threshold:          0.65,
+		MaxSpread:          0.05,
+		PrewarmSeconds:     15,
+		EntryMaxLag:        2 * time.Second,
+		ExitEarly:          300 * time.Millisecond,
+		Leverage:           1,
+		EquityFraction:     1,
+		MarketSlippage:     0.02,
+		StopPricePct:       0.00125,
+		DryRun:             true,
+		HaltDDpct:          0.08,
 		HaltExitLateStreak: 3,
 		HaltPositionMax:    6 * time.Minute,
 	}
@@ -74,6 +74,55 @@ func TestEnsureFlatPrewarmNoopWithLivePos(t *testing.T) {
 	}
 	if e.pos == nil {
 		t.Fatal("skip must not clear intentional position")
+	}
+}
+
+func TestEnsureReadyRefreshesStaleSnapshot(t *testing.T) {
+	cfg := testConfig()
+	e := New(cfg, nil, nil, nil, nil, nil, nil, nil, nil)
+	e.global.StartEquity = 25
+	e.readyAt = time.Now().Add(-10 * time.Second)
+	e.readyEq, e.readyPx, e.readyOK = 1, 1, false
+	called := false
+	e.pxProbe = func(context.Context) (float64, error) {
+		called = true
+		return 60100, nil
+	}
+	eq, px, err := e.ensureReady(context.Background(), time.Now().Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called || eq != 25 || px != 60100 || !e.readyOK {
+		t.Fatalf("eq=%v px=%v ok=%v called=%v", eq, px, e.readyOK, called)
+	}
+}
+
+func TestEnsureReadySkipsRefreshWhenFresh(t *testing.T) {
+	cfg := testConfig()
+	e := New(cfg, nil, nil, nil, nil, nil, nil, nil, nil)
+	e.readyAt = time.Now()
+	e.readyEq, e.readyPx, e.readyOK = 25, 60100, true
+	e.pxProbe = func(context.Context) (float64, error) {
+		t.Fatal("fresh snapshot must not hit the venue")
+		return 0, nil
+	}
+	eq, px, err := e.ensureReady(context.Background(), time.Now().Add(2*time.Second))
+	if err != nil || eq != 25 || px != 60100 {
+		t.Fatalf("eq=%v px=%v err=%v", eq, px, err)
+	}
+}
+
+func TestEnsureReadyNoTimeDoesNotRefresh(t *testing.T) {
+	cfg := testConfig()
+	e := New(cfg, nil, nil, nil, nil, nil, nil, nil, nil)
+	e.readyAt = time.Now().Add(-10 * time.Second)
+	e.pxProbe = func(context.Context) (float64, error) {
+		t.Fatal("no budget must not hit the venue")
+		return 0, nil
+	}
+	_, _, err := e.ensureReady(context.Background(), time.Now().Add(50*time.Millisecond))
+	if err == nil {
+		t.Fatal("expected not ready")
 	}
 }
 

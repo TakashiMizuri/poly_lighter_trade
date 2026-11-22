@@ -293,7 +293,7 @@ Flatness **трёхзначная**: `flat` / `open` / `unknown` (сеть). О�
 5. PnL и `ExitReason`: `sl` | `closed_away` | `halt` | `window_close` | … Подтверждённый fill пишет цену и PnL. Без fill на границе цена и PnL остаются пустыми (`state=exit_pending`), ноль в статистику не попадает.
 6. `pos=nil`, shadow async (только shadow-колонки), `waitNextOpen(next)` → `decide(next)`.
 
-**Инвариант границы:** `window_close` не должен съедать T+2 следующего окна. На `nextSoon` — один cancel+IOC без длинного ConfirmFill. Цена выхода не подменяется ценой входа. `refineExitAsync` дописывает fill отдельным UPDATE. Пока этот close in-flight и счёт не flat, новый вход и повторный reduce запрещены. Arm next — до `exitAt`.
+**Инвариант границы:** `window_close` не должен съедать T+2 следующего окна. На `nextSoon` ленту до reduce не читаем; cancel+IOC ограничены дедлайном, который оставляет ~1.1 с из T+2 на `decide`. Цена выхода не подменяется ценой входа. `refineExitAsync` дописывает fill отдельным UPDATE. Пока этот close in-flight и счёт не flat, новый вход и повторный reduce запрещены. Arm next — до `exitAt`. Если :00 уже наступило, полный arm не блокирует цикл: его делает `decide` внутри дедлайна входа.
 
 ---
 
@@ -310,6 +310,7 @@ p_up ≥ th? ──да──► LONG
 p_up ≤ 1-th? ──да──► SHORT
 обе ≥ th? ──да──► both_ge_th + alert
 иначе ──────────────► below_th
+ready свежий (≤5с)? ──нет──► один refresh в остатке T+2, иначе skip ready
 ready/equity/qty ok? ──нет──► ready / equity_too_small
 счёт не flat / close in-flight? ──да──► skip not_flat
 → send entry

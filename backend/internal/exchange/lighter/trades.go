@@ -225,11 +225,28 @@ func (o ExchangeOrder) Unix() float64 {
 }
 
 // CreatedUnix is the exchange order-creation time (not trade print, not local clock).
-func (o ExchangeOrder) CreatedUnix() float64 {
-	if u := tradeUnix(o.CreatedAt); u > 0 {
-		return u
+// precise is false when every candidate is whole seconds. A second stamp that
+// falls in the window's open second becomes a fake 0 ms lag and must not be stored.
+func (o ExchangeOrder) CreatedUnix() (unix float64, precise bool) {
+	if u, ok := preciseUnix(o.CreatedAt); ok {
+		return u, true
 	}
-	return tradeUnix(o.Timestamp)
+	if u, ok := preciseUnix(o.Timestamp); ok {
+		return u, true
+	}
+	return 0, false
+}
+
+// preciseUnix accepts millisecond or microsecond stamps only.
+func preciseUnix(ts int64) (float64, bool) {
+	if ts <= 1_000_000_000_000 {
+		return 0, false
+	}
+	u := coarseUnix(ts)
+	if u <= 0 {
+		return 0, false
+	}
+	return u, true
 }
 
 func coarseUnix(ts int64) float64 {
@@ -286,4 +303,3 @@ func (c *HTTPClient) OrderByClient(ctx context.Context, accountIndex, clientIdx 
 	}
 	return ExchangeOrder{}, fmt.Errorf("order %d not found", clientIdx)
 }
-

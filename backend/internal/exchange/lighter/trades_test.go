@@ -29,6 +29,32 @@ func TestSameTxHash(t *testing.T) {
 	}
 }
 
+func TestCreatedUnixIgnoresWholeSeconds(t *testing.T) {
+	window := int64(1_795_273_200)
+	sec := ExchangeOrder{CreatedAt: window, Timestamp: window}
+	if _, ok := sec.CreatedUnix(); ok {
+		t.Fatal("whole-second stamp must not count as a lag")
+	}
+	ms := window*1000 + 495
+	u, ok := ExchangeOrder{CreatedAt: ms}.CreatedUnix()
+	if !ok {
+		t.Fatal("millisecond stamp must be precise")
+	}
+	lag := (u - float64(window)) * 1000
+	if lag < 494.5 || lag > 495.5 {
+		t.Fatalf("lag=%v", lag)
+	}
+	us := window*1_000_000 + 730_000
+	u, ok = ExchangeOrder{Timestamp: us}.CreatedUnix()
+	if !ok {
+		t.Fatal("microsecond stamp must be precise")
+	}
+	lag = (u - float64(window)) * 1000
+	if lag < 729.5 || lag > 730.5 {
+		t.Fatalf("us lag=%v", lag)
+	}
+}
+
 func TestFillsClosingPositionSkipsEntry(t *testing.T) {
 	fills := []Fill{
 		{Price: 56125, Size: 0.00044, Timestamp: 1_000, TxHash: "entryhash", AskClient: 10},

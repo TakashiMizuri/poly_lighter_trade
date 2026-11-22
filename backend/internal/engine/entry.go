@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -103,14 +104,19 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	e.mu.Lock()
 	mkt := e.armedMarket
 	armed := e.armedFor == ts
-	eq, px := e.readyEq, e.readyPx
 	e.mu.Unlock()
+	// Arm under the entry deadline. A resolve that starts after :00 must not
+	// run the full prewarm budget and push the quote past T+2.
+	deadline := e.entryDeadline(ts)
 	if !armed {
 		tArm := time.Now()
-		if err := e.arm(ctx, ts); err != nil {
+		actx, acancel := context.WithDeadline(ctx, deadline)
+		err := e.arm(actx, ts)
+		acancel()
+		e.traceDur("arm", tArm)
+		if err != nil {
 			return e.finishSkip(ctx, w, "no_market", err.Error())
 		}
-		e.traceDur("arm", tArm)
 		e.mu.Lock()
 		mkt = e.armedMarket
 		e.mu.Unlock()
@@ -119,7 +125,6 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "no_market", "empty tokens")
 	}
 
-	deadline := e.entryDeadline(ts)
 	qctx, qcancel := context.WithDeadline(ctx, deadline)
 	tQ := time.Now()
 	q, err := e.PM.SnapshotUp(qctx, mkt, e.now(), time.Second)
@@ -172,16 +177,14 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 		return e.finishSkip(ctx, w, "late", "late after quote")
 	}
 
-	e.mu.Lock()
-	readyOK, readyAt := e.readyOK, e.readyAt
-	e.mu.Unlock()
-	if eq <= 0 || px <= 0 || readyAt.IsZero() || time.Since(readyAt) > 5*time.Second {
-		return e.finishSkip(ctx, w, "ready", "equity/price/flat state is not fresh from prewarm")
-	}
-	if !readyOK || e.closeInFlight() {
-		if err := e.confirmFlatForEntry(ctx, deadline); err != nil {
-			return e.finishSkip(ctx, w, "not_flat", err.Error())
+	// One refresh inside the time left for the order. A stale prewarm snapshot
+	// must not drop a signal that still fits in T+2 (the 23:30 / p_up 0.855 skip).
+	eq, px, readyErr := e.ensureReady(ctx, deadline)
+	if readyErr != nil {
+		if errors.Is(readyErr, errAccountNotFlat) {
+			return e.finishSkip(ctx, w, "not_flat", readyErr.Error())
 		}
+		return e.finishSkip(ctx, w, "ready", readyErr.Error())
 	}
 	meta := e.Markets[e.Cfg.Symbol]
 	qty := strategy.FloorLot((eq*e.Cfg.EquityFraction*e.Cfg.Leverage)/px, meta.SizeDecimals)
@@ -347,19 +350,22 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	}
 	// Query exchange creation time only after the protective stop has been
 	// submitted; telemetry must never delay risk protection.
+	// Whole-second stamps are not a lag: they collapse any fill in the open
+	// second to 0 ms. Leave fill_lag null so the mean ignores them. The local
+	// send-ack stays in the stage trace and is not this metric.
 	octx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	tOrd := time.Now()
 	if o, err := e.HTTP.OrderByClient(octx, e.Cfg.AccountIndex, clientIdx); err == nil {
-		if u := o.CreatedUnix(); u > 0 {
-			fillLag = sql.NullFloat64{Float64: (u - float64(ts)) * 1000, Valid: true}
-			fillTS = u
+		if u, precise := o.CreatedUnix(); precise && u > 0 {
+			lagMS := (u - float64(ts)) * 1000
+			if lagMS > 0 {
+				fillLag = sql.NullFloat64{Float64: lagMS, Valid: true}
+				fillTS = u
+			}
 		}
 	}
 	e.traceDur("order_get", tOrd)
 	cancel()
-	if !fillLag.Valid {
-		fillLag = sql.NullFloat64{Float64: float64(sendAckAt.Sub(time.Unix(ts, 0).UTC()) / time.Millisecond), Valid: true}
-	}
 	if fillLag.Valid && e.tr != nil {
 		e.tr.t.MsOpenToExchange = fillLag.Float64
 	}

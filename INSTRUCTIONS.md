@@ -6,7 +6,8 @@
 Это **отдельный** Docker Compose, **отдельный** каталог, **отдельный** счёт Lighter, **отдельный** Telegram-бот, **отдельный** порт дашборда. Donchian (`/opt/donchian`) не останавливать и его `.env.a` не трогать.
 
 **Уже стоит на VPS и нужно подтянуть код + полный сброс БД/логов:** §11 (один блок на SSH).  
-**Снять логи + БД для разбора (бот не останавливать):** §11.1. Не копировать `.env.example` поверх живого `.env`.
+**Снять логи + БД для разбора (бот не останавливать):** §11.1.  
+**`web` не поднялся, потому что `bot` unhealthy:** §11.2. Не копировать `.env.example` поверх живого `.env`.
 
 | | Donchian | Этот бот |
 |--|--|--|
@@ -426,6 +427,8 @@ docker compose exec bot printenv LIGHTER_ACCOUNT_INDEX LIGHTER_API_KEY_INDEX KIL
 
 Откат кода: `git log -5 --oneline`, `git checkout <коммит>`, снова `up -d --build --force-recreate`. Данные — из `backups/data-*.tgz`.
 
+Если в конце `up` видно `dependency failed to start: container poly-lighter-bot-1 is unhealthy` / `web` в `Created` — см. §11.2.
+
 ### 11.1 Выгрузка логов + БД для анализа (SSH)
 
 Бота **не** останавливать. Ключи в архив не попадают.
@@ -479,6 +482,34 @@ scp root@45.134.218.19:/tmp/poly-lighter-diagnostic.tar.gz C:\All\Develop\poly_l
 ```
 
 В чат: «архив готов».
+
+### 11.2 `web` не стартовал (`bot` unhealthy)
+
+В `docker-compose.yml` у `web` стоит `depends_on: bot` с `condition: service_healthy`. Пока healthcheck бота не зелёный, compose не поднимает дашборд — контейнер `poly-lighter-web-1` остаётся в `Created`.
+
+Дашборд можно поднять отдельно, не дожидаясь healthy бота:
+
+```bash
+cd /opt/poly-lighter
+docker compose up -d --no-deps web
+```
+
+`--no-deps` стартует только `web`, без проверки health `bot`. Дашборд: `http://IP:8081/` (или `curl -s http://127.0.0.1:8081/`).
+
+Если контейнер уже создан:
+
+```bash
+docker start poly-lighter-web-1
+```
+
+Параллельно разбери, почему бот unhealthy:
+
+```bash
+docker compose ps
+docker compose logs --tail=100 bot
+```
+
+Пока `bot` не healthy, API за прокси nginx может отвечать ошибками — сам UI при этом уже доступен на `:8081`.
 
 ---
 
@@ -590,7 +621,7 @@ npm run dev
 | `sendTx` / nonce / `closed_away` через ~11 с | второй процесс на том же `LIGHTER_ACCOUNT_INDEX` (часто зомби `donchian-bot_b`); один бот на аккаунт и на `api_key_index` |
 | `stop_missing` / HALT после входа | проверь доступность Lighter и reduce-only stop; не снимай HALT, пока позиция flat и в `/api/orders` нет лишнего условного ордера |
 | Donchian позиции закрылись | **тот же account_index** — останови POLY, разберись, больше никогда не шарь счёт |
-| web unhealthy / не стартует | `bot` не healthy, смотри `logs bot` |
+| web unhealthy / не стартует | `bot` не healthy → §11.2 (`up -d --no-deps web`); смотри `logs bot` |
 | `restart` не подхватил `.env` | `up -d --force-recreate bot web` |
 
 Полезное:

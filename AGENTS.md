@@ -48,6 +48,20 @@
 | Выкат / VPS / рядом с Donchian | `INSTRUCTIONS.md` |
 | Краткий обзор продукта | `README.md` |
 | Часы / лаг / два бота на VPS | `BOTS_CLOCK_AND_LAG_CONTEXT.md` (контекст, не source of truth кода) |
+| Live vs бэктест на наших окнах | `scripts/live_vs_backtest.py` |
+
+## Сравнение live с бэктестом
+
+Когда пользователь просит прогнать бэктест на накопленных live-окнах или сравнить live с моделью — запускай `scripts/live_vs_backtest.py` на TSV-вставке дашборда. Не пиши новый прогон и не выбирай окна по CLOB `prices-history`: первый history print опаздывает на 10–15+ секунд и набирает лишние сделки.
+
+Контракт скрипта, его не менять «по пути»:
+
+- Гейт — наша `p_up` на :00. Фаворит ≥ 0.65 (`p_up` ≥ 0.65 лонг, ≤ 0.35 шорт).
+- Цена — Binance BTCUSDT 1s: вход = close T+1, стоп 0.125% по high/low с T+2 по T+299, иначе close T+299. Стоп в модели всегда −12.5 bps. Секунды из дневных zip в `new-algotrading-adventure/data/binance/btcusdt_1s/daily/`, дыры — REST klines.
+- Mean / sum / WR — только фактические входы (вкладка сделок, есть ret bps). Skip, который прошёл гейт, скрипт печатает отдельно и в среднее не кладёт, пока пользователь явно не попросит включить.
+- Зазор live−модель сравнивай с запасом из `docs/POLY_LIGHTER_STARTPACK_1_1.md`: красная линия ~1.5 bps, весь mean edge 1.72 bps.
+
+Пример, который должен сходиться с ночью 2026-11-21 21:30Z–03:25Z: `python scripts/live_vs_backtest.py scripts/testdata/dashboard-2026-11-21-night.tsv` → mean бэктеста −1.44, live −1.58, зазор −0.14, skip 23:30 вне среднего.
 
 ## Жёсткие ops-инварианты (не нарушать)
 

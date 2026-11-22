@@ -2,12 +2,19 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"poly-lighter.trade/bot/internal/clock"
 	"poly-lighter.trade/bot/internal/strategy"
 )
+
+// errAccountNotFlat means a live position is still open, so this window cannot enter.
+var errAccountNotFlat = errors.New("account not flat")
+
+// readySendReserve is the time ensureReady leaves for the entry IOC after a refresh.
+const readySendReserve = 700 * time.Millisecond
 
 func (e *Engine) Bootstrap(ctx context.Context) error {
 	g, err := e.Store.LoadGlobal(ctx)
@@ -179,7 +186,9 @@ func (e *Engine) waitNextOpen(ctx context.Context, next int64) error {
 	e.mu.Lock()
 	alreadyArmed := e.armedFor == next
 	e.mu.Unlock()
-	if !alreadyArmed {
+	// Once :00 has passed, a blocking arm here is what pushes decide past T+2.
+	// decide arms under the entry deadline instead.
+	if !alreadyArmed && e.now().Before(serverOpen) {
 		tArm := time.Now()
 		if err := e.arm(ctx, next); err != nil {
 			e.Log.Warn("arm", "err", err, "ts", next)
@@ -251,9 +260,42 @@ func (e *Engine) refreshReady(ctx context.Context) error {
 				e.Log.Error("prewarm flatten", "err", err)
 			}
 		}()
-		return fmt.Errorf("unexpected position flattened during prewarm; entry disabled for this window")
+		return errAccountNotFlat
 	}
 	return nil
+}
+
+// ensureReady returns equity and price for an entry. A snapshot older than 5s
+// gets one account+price read, capped so the IOC still fits before deadline.
+func (e *Engine) ensureReady(ctx context.Context, deadline time.Time) (float64, float64, error) {
+	if eq, px, ok := e.readySnapshot(); ok && !e.closeInFlight() {
+		return eq, px, nil
+	}
+	budget := time.Until(deadline) - readySendReserve
+	if budget < 80*time.Millisecond {
+		return 0, 0, fmt.Errorf("equity/price/flat state is not fresh and no time to refresh")
+	}
+	if budget > 450*time.Millisecond {
+		budget = 450 * time.Millisecond
+	}
+	rctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	if err := e.refreshReady(rctx); err != nil {
+		return 0, 0, err
+	}
+	e.clearPendingClose()
+	eq, px, ok := e.readySnapshot()
+	if !ok {
+		return 0, 0, fmt.Errorf("equity/price/flat state is not fresh from prewarm")
+	}
+	return eq, px, nil
+}
+
+func (e *Engine) readySnapshot() (eq, px float64, ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ok = e.readyOK && e.readyEq > 0 && e.readyPx > 0 && !e.readyAt.IsZero() && time.Since(e.readyAt) <= 5*time.Second
+	return e.readyEq, e.readyPx, ok
 }
 
 func (e *Engine) markReadyAfterClose(px, eq float64, flat bool) {
