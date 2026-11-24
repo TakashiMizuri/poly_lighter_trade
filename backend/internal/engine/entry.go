@@ -375,7 +375,8 @@ func (e *Engine) decide(ctx context.Context, ts int64) error {
 	e.saveWindow(ctx, w)
 	e.setState(StateInPosition)
 	e.flogWindow("entry", w)
-	e.alert(ctx, "info", "entry", fmt.Sprintf("%s qty=%.6f px=%.2f p_up=%.3f lag=—", side, usedQty, fillPx, pUp))
+	lagMS := sendAckAt.Sub(time.Unix(ts, 0).UTC()).Milliseconds()
+	e.alert(ctx, "info", "entry", fmt.Sprintf("%s qty=%.6f px=%.2f p_up=%.3f lag=%dms", side, usedQty, fillPx, pUp, lagMS))
 	go e.recordFillLag(ts, clientIdx)
 	return nil
 }

@@ -2,6 +2,7 @@ package lighter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -19,10 +20,11 @@ const (
 )
 
 type Signer struct {
-	Tx   *lighterclient.TxClient
-	HTTP *HTTPClient
-	Meta map[string]MarketMeta
-	Log  *slog.Logger
+	Tx     *lighterclient.TxClient
+	HTTP   *HTTPClient
+	Stream *Stream
+	Meta   map[string]MarketMeta
+	Log    *slog.Logger
 
 	tokMu      sync.Mutex
 	token      string
@@ -108,6 +110,48 @@ func (s *Signer) takeNonce(ctx context.Context) (int64, error) {
 
 func (s *Signer) invalidateNonce() { s.nonceReady = false }
 
+// noteSubmitErr rolls the local nonce back when the tx never left.
+// An ambiguous ack keeps the incremented nonce. A venue reject forces a refetch.
+func (s *Signer) noteSubmitErr(nonce int64, err error) {
+	if err == nil {
+		return
+	}
+	if IsPreConnectFail(err) {
+		if s.nonceReady && s.nextNonce == nonce+1 {
+			s.nextNonce = nonce
+		}
+		return
+	}
+	if IsAmbiguousSubmit(err) {
+		return
+	}
+	s.invalidateNonce()
+}
+
+func notSubmitted(err error) error {
+	if err == nil || errors.Is(err, ErrNotSubmitted) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrNotSubmitted, err)
+}
+
+func (s *Signer) submit(ctx context.Context, txType int, txInfo string) (*SendTxResp, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, notSubmitted(err)
+	}
+	if s.Stream != nil && s.Stream.Connected() {
+		resp, err := s.Stream.SendTx(ctx, txType, txInfo)
+		if err == nil || ctx.Err() != nil || !errors.Is(err, ErrStreamDown) {
+			return resp, err
+		}
+		s.audit("order send fallback", "err", err.Error())
+	}
+	if s.HTTP == nil {
+		return nil, ErrStreamDown
+	}
+	return s.HTTP.SendTx(ctx, txType, txInfo)
+}
+
 func (s *Signer) MarketIOC(ctx context.Context, symbol string, buy bool, qty, refPrice, slippage float64, clientIdx int64, reduceOnly bool) (*OrderResult, error) {
 	s.txMu.Lock()
 	defer s.txMu.Unlock()
@@ -156,24 +200,24 @@ func (s *Signer) MarketIOC(ctx context.Context, symbol string, buy bool, qty, re
 	nonce, err := s.takeNonce(ctx)
 	if err != nil {
 		s.audit("order skip", "kind", "market_ioc", "symbol", symbol, "client_idx", clientIdx, "err", err.Error())
-		return nil, err
+		return nil, notSubmitted(err)
 	}
 	info, err := s.Tx.GetCreateOrderTransaction(req, &types.TransactOpts{Nonce: &nonce})
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, ErrNotSubmitted)
 		s.audit("order sign", "kind", "market_ioc", "nonce", nonce, "client_idx", clientIdx, "err", err.Error())
-		return nil, err
+		return nil, notSubmitted(err)
 	}
 	js, err := info.GetTxInfo()
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, ErrNotSubmitted)
 		s.audit("order sign", "kind", "market_ioc", "nonce", nonce, "client_idx", clientIdx, "err", err.Error())
-		return nil, err
+		return nil, notSubmitted(err)
 	}
 	s.audit("order send", "kind", "market_ioc", "symbol", symbol, "buy", buy, "qty", qty, "ref", refPrice, "worst", worst, "reduce_only", reduceOnly, "client_idx", clientIdx, "nonce", nonce, "is_ask", isAsk)
-	resp, err := s.HTTP.SendTx(ctx, txtypes.TxTypeL2CreateOrder, js)
+	resp, err := s.submit(ctx, txtypes.TxTypeL2CreateOrder, js)
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, err)
 		s.audit("order result", "kind", "market_ioc", "client_idx", clientIdx, "nonce", nonce, "err", err.Error())
 		return nil, err
 	}
@@ -204,22 +248,22 @@ func (s *Signer) UpdateLeverage(ctx context.Context, symbol string, leverage flo
 	}
 	nonce, err := s.takeNonce(ctx)
 	if err != nil {
-		return err
+		return notSubmitted(err)
 	}
 	info, err := s.Tx.GetUpdateLeverageTransaction(req, &types.TransactOpts{Nonce: &nonce})
 	if err != nil {
-		s.invalidateNonce()
-		return err
+		s.noteSubmitErr(nonce, ErrNotSubmitted)
+		return notSubmitted(err)
 	}
 	js, err := info.GetTxInfo()
 	if err != nil {
-		s.invalidateNonce()
-		return err
+		s.noteSubmitErr(nonce, ErrNotSubmitted)
+		return notSubmitted(err)
 	}
 	s.audit("order send", "kind", "leverage", "symbol", symbol, "leverage", leverage, "imf", imf, "nonce", nonce)
-	_, err = s.HTTP.SendTx(ctx, txtypes.TxTypeL2UpdateLeverage, js)
+	_, err = s.submit(ctx, txtypes.TxTypeL2UpdateLeverage, js)
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, err)
 		s.audit("order result", "kind", "leverage", "nonce", nonce, "err", err.Error())
 	} else {
 		s.audit("order result", "kind", "leverage", "nonce", nonce)
@@ -273,24 +317,24 @@ func (s *Signer) StopLoss(ctx context.Context, symbol string, buyPosition bool, 
 	nonce, err := s.takeNonce(ctx)
 	if err != nil {
 		s.audit("order skip", "kind", "stop_loss", "client_idx", clientIdx, "err", err.Error())
-		return nil, err
+		return nil, notSubmitted(err)
 	}
 	info, err := s.Tx.GetCreateOrderTransaction(req, &types.TransactOpts{Nonce: &nonce})
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, ErrNotSubmitted)
 		s.audit("order sign", "kind", "stop_loss", "nonce", nonce, "client_idx", clientIdx, "err", err.Error())
-		return nil, err
+		return nil, notSubmitted(err)
 	}
 	js, err := info.GetTxInfo()
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, ErrNotSubmitted)
 		s.audit("order sign", "kind", "stop_loss", "nonce", nonce, "client_idx", clientIdx, "err", err.Error())
-		return nil, err
+		return nil, notSubmitted(err)
 	}
 	s.audit("order send", "kind", "stop_loss", "symbol", symbol, "buy_position", buyPosition, "qty", qty, "stop", stop, "worst", worst, "client_idx", clientIdx, "nonce", nonce, "is_ask", isAsk, "reduce_only", true)
-	resp, err := s.HTTP.SendTx(ctx, txtypes.TxTypeL2CreateOrder, js)
+	resp, err := s.submit(ctx, txtypes.TxTypeL2CreateOrder, js)
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, err)
 		s.audit("order result", "kind", "stop_loss", "client_idx", clientIdx, "nonce", nonce, "err", err.Error())
 		return nil, err
 	}
@@ -304,27 +348,27 @@ func (s *Signer) CancelAll(ctx context.Context) error {
 	nonce, err := s.takeNonce(ctx)
 	if err != nil {
 		s.audit("order skip", "kind", "cancel_all", "err", err.Error())
-		return err
+		return notSubmitted(err)
 	}
 	info, err := s.Tx.GetCancelAllOrdersTransaction(&types.CancelAllOrdersTxReq{
 		TimeInForce: txtypes.ImmediateCancelAll,
 		Time:        0,
 	}, &types.TransactOpts{Nonce: &nonce})
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, ErrNotSubmitted)
 		s.audit("order sign", "kind", "cancel_all", "nonce", nonce, "err", err.Error())
-		return err
+		return notSubmitted(err)
 	}
 	js, err := info.GetTxInfo()
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, ErrNotSubmitted)
 		s.audit("order sign", "kind", "cancel_all", "nonce", nonce, "err", err.Error())
-		return err
+		return notSubmitted(err)
 	}
 	s.audit("order send", "kind", "cancel_all", "nonce", nonce)
-	_, err = s.HTTP.SendTx(ctx, txtypes.TxTypeL2CancelAllOrders, js)
+	_, err = s.submit(ctx, txtypes.TxTypeL2CancelAllOrders, js)
 	if err != nil {
-		s.invalidateNonce()
+		s.noteSubmitErr(nonce, err)
 		s.audit("order result", "kind", "cancel_all", "nonce", nonce, "err", err.Error())
 	} else {
 		s.audit("order result", "kind", "cancel_all", "nonce", nonce)

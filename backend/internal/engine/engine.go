@@ -70,31 +70,33 @@ type Engine struct {
 	Flog    *flog.Logger
 	Log     *slog.Logger
 
-	mu          sync.Mutex
-	clockSyncMu sync.Mutex
-	state       string
-	offset      time.Duration
-	offsetOK    bool
-	offsetAt    time.Time
-	clockRTT    time.Duration
-	pos         *livePos
-	pending     *pendingClose
-	lastQuote   strategy.Quote
-	lastSkip    string
-	lastWindow  int64
-	armedFor    int64
-	armedMarket polymarket.Market
-	wsPM        string
-	started     time.Time
-	global      store.GlobalState
-	bootWindow  int64
-	consumedTS  int64
-	readyEq     float64
-	readyPx     float64
-	readyAt     time.Time
-	readyOK     bool
-	tr          *winTrace
-	lastTimings *store.Timings
+	mu           sync.Mutex
+	clockSyncMu  sync.Mutex
+	state        string
+	offset       time.Duration
+	offsetOK     bool
+	offsetAt     time.Time
+	clockRTT     time.Duration
+	pos          *livePos
+	pending      *pendingClose
+	lastQuote    strategy.Quote
+	lastSkip     string
+	lastWindow   int64
+	armedFor     int64
+	armedMarket  polymarket.Market
+	wsPM         string
+	started      time.Time
+	global       store.GlobalState
+	bootWindow   int64
+	consumedTS   int64
+	readyEq      float64
+	readyPx      float64
+	readyAt      time.Time
+	readyOK      bool
+	needsFlatten bool
+	flattenTry   time.Time
+	tr           *winTrace
+	lastTimings  *store.Timings
 
 	// Test seams (nil in production).
 	flatProbe        func(context.Context) (bool, lighter.Position, error)

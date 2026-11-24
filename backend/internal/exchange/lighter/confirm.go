@@ -43,6 +43,12 @@ func (c *HTTPClient) ConfirmFill(ctx context.Context, opts ConfirmFillOpts) Conf
 	lot := math.Pow10(-opts.SizeDecimals)
 	var tradesErr, acctErr error
 	for {
+		if c.Stream != nil {
+			if px, qty, fee, ok := c.Stream.Fill(opts.ClientIdx); ok && qty > 0 && px > 0 {
+				out.Px, out.Qty, out.Fee = px, qty, fee
+				return out
+			}
+		}
 		fills, err := c.AccountTradesUrgent(ctx, opts.AccountIndex, opts.MarketID, 100)
 		tradesErr = err
 		if err == nil {

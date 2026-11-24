@@ -3,7 +3,7 @@
 Краткая навигация для ИИ и людей. Детали стратегии — в `docs/`, деплой — в `INSTRUCTIONS.md`.  
 **Обновляй эту карту**, когда меняется структура, ответственность пакетов или критичные потоки.
 
-Последняя актуализация: 2026-11-22 (плановый выход стартует за 1500 мс до границы).
+Последняя актуализация: 2026-11-24 (Lighter stream: sendtx, филлы, last; лаг дашборда — ack sendTx).
 
 ---
 
@@ -75,7 +75,9 @@ main.go
        → confirm fill + optional stop-loss
        → hold → exit starts 1500ms before the boundary / detect remote close / flatten
        → settle: one reduce; on the boundary, no pre-close tape and cancel+IOC deadline leaves T+2 for decide; the exit order row is written on its own short context; exit px/PnL only from the tape (refine async)
-       → decide refreshes a stale equity/price snapshot once inside the entry budget; fill lag is a sub-second created_at written asynchronously after the stop
+       → decide refreshes a stale equity/price snapshot once inside the entry budget; the dashboard lag is the local sendTx ack, and a sub-second exchange created_at is stored beside it
+       → Lighter stream (wss …/stream) sends jsonapi/sendtx and pushes fills + last; REST is the fallback when the socket is down. Ping every 60s, reconnect on drop
+       → a boundary close does not cancel the stop unless the IOC still fits; an unbooked exit is repaired on a timer onto the original window
        → shadow binance (shadow columns only)
   ↔ api.Server (dashboard, kill/resume, status)
 ```
@@ -90,7 +92,7 @@ main.go
 |-------|-----------------|----------------|
 | `engine` | Оркестрация окна, позиции, halt/kill, timing traces | `engine.go` (types), `lifecycle.go`, `entry.go`, `exit.go` (flatness/settle/watchdog), `risk.go`, `shadow.go`, `persist.go`, `trace.go`, `snapshot.go` |
 | `strategy` | Порог/спред → side; stop price; lot floor | `gate.go`, `stop.go` |
-| `exchange/lighter` | REST, SendTx, подпись ордеров, fills/tape, ambiguous submit | `http.go`, `signer.go`, `trades.go`, `ambiguous.go` |
+| `exchange/lighter` | REST + stream (sendtx, филлы, last), подпись, ambiguous submit, DNS-кэш | `http.go`, `stream.go`, `dial.go`, `signer.go`, `trades.go`, `ambiguous.go` |
 | `polymarket` | Событие/slug, book quotes | `client.go` |
 | `binance` | Shadow close / stop-hit proxy | `client.go` |
 | `store` | Persistence windows/orders/events/global | `store.go`, `timings.go` |

@@ -64,12 +64,21 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 		fillWait = 0
 	}
 
+	cancelledStop := false
 	if plan.CancelAll && e.Signer != nil {
-		if err := e.Signer.CancelAll(workCtx); err != nil {
+		if !closeBudgetLeft(workCtx, 700*time.Millisecond) {
+			// Cancelling the stop and then missing the IOC leaves the position naked.
+			e.Log.Warn("settle: leaving the stop, no time to cancel and close", "reason", reason)
+			plan.CancelAll = false
+			plan.MarketClose = false
+		} else if err := e.Signer.CancelAll(workCtx); err != nil {
 			e.Log.Warn("cancel orders during settle", "err", err, "reason", reason, "mode", plan.Mode)
-		} else if e.Store != nil {
-			if err := e.Store.CancelOpenStops(ctx, pos.WindowTS); err != nil {
-				e.Log.Warn("mark stops canceled", "err", err, "window_ts", pos.WindowTS)
+		} else {
+			cancelledStop = true
+			if e.Store != nil {
+				if err := e.Store.CancelOpenStops(ctx, pos.WindowTS); err != nil {
+					e.Log.Warn("mark stops canceled", "err", err, "window_ts", pos.WindowTS)
+				}
 			}
 		}
 	}
@@ -82,6 +91,9 @@ func (e *Engine) finalizePosition(ctx context.Context, pos *livePos, reason stri
 		cpx, cfee, err := e.sendMarketClose(workCtx, pos, fillWait)
 		if err != nil {
 			e.alert(ctx, "error", "flatten", err.Error())
+			if cancelledStop && lighter.IsPreConnectFail(err) {
+				e.flagFlatten()
+			}
 		}
 		if cpx > 0 {
 			if plan.Mode == settleCloseResidual || plan.Mode == settleCloseKeepStop {
@@ -361,9 +373,21 @@ func (e *Engine) marketClose(ctx context.Context, pos *livePos) (px, fee float64
 	return e.sendMarketClose(ctx, pos, 800*time.Millisecond)
 }
 
+// closeBudgetLeft reports whether the context still has room for a cancel plus the IOC.
+func closeBudgetLeft(ctx context.Context, min time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return time.Until(deadline) >= min
+}
+
 func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait time.Duration) (px, fee float64, err error) {
 	if e.marketCloseProbe != nil {
 		return e.marketCloseProbe(pos)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, 0, fmt.Errorf("%w: %v", lighter.ErrNotSubmitted, err)
 	}
 	if e.Cfg.DryRun || e.Signer == nil {
 		px, err = e.btcPx(ctx)
@@ -596,6 +620,66 @@ func (e *Engine) clearPendingClose() {
 	e.mu.Unlock()
 }
 
+func (e *Engine) failInFlight() {
+	e.mu.Lock()
+	if e.pending != nil {
+		e.pending.Failed = true
+	}
+	e.mu.Unlock()
+}
+
+func (e *Engine) pendingWindow() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pending == nil {
+		return 0
+	}
+	return e.pending.WindowTS
+}
+
+func (e *Engine) flagFlatten() {
+	e.mu.Lock()
+	e.needsFlatten = true
+	e.mu.Unlock()
+}
+
+// pendingFillBooked writes a tape or stream fill onto the original window.
+func (e *Engine) pendingFillBooked(ctx context.Context) bool {
+	e.mu.Lock()
+	p := e.pending
+	e.mu.Unlock()
+	if p == nil || p.ClientIdx == 0 || e.HTTP == nil || e.Cfg == nil {
+		return false
+	}
+	px, qty, fee, ok := 0.0, 0.0, 0.0, false
+	if e.HTTP.Stream != nil {
+		px, qty, fee, ok = e.HTTP.Stream.Fill(p.ClientIdx)
+	}
+	if !ok || qty <= 0 || px <= 0 {
+		meta, mok := e.Markets[e.Cfg.Symbol]
+		if !mok {
+			return false
+		}
+		cctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+		fills, err := e.HTTP.AccountTradesUrgent(cctx, e.Cfg.AccountIndex, meta.MarketID, 100)
+		cancel()
+		if err != nil {
+			return false
+		}
+		px, qty, fee, _ = lighter.VWAP(lighter.FillsMatching(fills, p.ClientIdx, p.TxHash))
+	}
+	if qty <= 0 || px <= 0 {
+		return false
+	}
+	if err := e.bookExitFill(ctx, store.UnconfirmedExit{
+		WindowTS: p.WindowTS, Side: p.Side, ClientIdx: p.ClientIdx, TxHash: p.TxHash,
+	}, px, fee); err != nil {
+		e.Log.Warn("book in-flight exit", "err", err, "window_ts", p.WindowTS)
+		return false
+	}
+	return true
+}
+
 // confirmFlatForEntry blocks a new entry while the previous reduce is still
 // working or the account is not flat. It does not send another order.
 func (e *Engine) confirmFlatForEntry(ctx context.Context, deadline time.Time) error {
@@ -646,8 +730,16 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 				e.clearPendingClose()
 				return nil
 			}
-			e.Log.Warn("flatten deferred; close in flight", "why", why, "err", err)
-			return nil
+			if err != nil {
+				e.Log.Warn("flatten deferred; close in flight", "why", why, "err", err)
+				return nil
+			}
+			// The account is still open. One tape read, then one new reduce.
+			if e.pendingFillBooked(ctx) {
+				e.clearPendingClose()
+				return nil
+			}
+			e.failInFlight()
 		}
 	}
 	if e.Cfg.DryRun || (e.Signer == nil && e.marketCloseProbe == nil) {
@@ -669,7 +761,11 @@ func (e *Engine) ensureFlat(ctx context.Context, why string) error {
 		return nil
 	}
 	e.Log.Warn("flatten", "why", why, "qty", pos.Size, "sign", pos.Sign)
-	live := &livePos{WindowTS: clock.WindowOf(e.now()), Qty: pos.Size, Side: strategy.SideLong}
+	origin := e.pendingWindow()
+	if origin == 0 {
+		origin = clock.WindowOf(e.now())
+	}
+	live := &livePos{WindowTS: origin, Qty: pos.Size, Side: strategy.SideLong}
 	if pos.Sign < 0 {
 		live.Side = strategy.SideShort
 	}

@@ -326,13 +326,13 @@ func TestFinalizeBoundaryDoesNotCopyEntry(t *testing.T) {
 	}
 }
 
-func TestEnsureFlatDoesNotSendWhileCloseInFlight(t *testing.T) {
+func TestEnsureFlatDefersWhenFlatnessUnknown(t *testing.T) {
 	cfg := testConfig()
 	cfg.DryRun = false
 	e := New(cfg, nil, nil, nil, nil, nil, nil, nil, nil)
 	e.pending = &pendingClose{WindowTS: 1, ClientIdx: 287000012, Side: strategy.SideShort}
 	e.flatProbe = func(context.Context) (bool, lighter.Position, error) {
-		return false, lighter.Position{Size: 0.00041, Sign: -1}, nil
+		return false, lighter.Position{}, errors.New("dns timeout")
 	}
 	called := 0
 	e.marketCloseProbe = func(*livePos) (float64, float64, error) {
@@ -346,7 +346,45 @@ func TestEnsureFlatDoesNotSendWhileCloseInFlight(t *testing.T) {
 		t.Fatalf("market closes=%d", called)
 	}
 	if !e.closeInFlight() {
-		t.Fatal("in-flight close was cleared")
+		t.Fatal("unknown flatness must keep the in-flight close")
+	}
+}
+
+func TestEnsureFlatResendsWhenInFlightStillOpen(t *testing.T) {
+	cfg := testConfig()
+	cfg.DryRun = false
+	e := New(cfg, nil, nil, nil, nil, nil, nil, nil, nil)
+	e.pending = &pendingClose{WindowTS: 1, ClientIdx: 287000012, Side: strategy.SideShort}
+	called := 0
+	e.flatProbe = func(context.Context) (bool, lighter.Position, error) {
+		if called > 0 {
+			return true, lighter.Position{}, nil
+		}
+		return false, lighter.Position{Size: 0.00041, Sign: -1}, nil
+	}
+	e.marketCloseProbe = func(p *livePos) (float64, float64, error) {
+		called++
+		if p.WindowTS != 1 {
+			t.Fatalf("retry booked on window %d", p.WindowTS)
+		}
+		return 60100, 0, nil
+	}
+	if err := e.ensureFlat(context.Background(), "skip"); err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 {
+		t.Fatalf("market closes=%d", called)
+	}
+}
+
+func TestCloseBudgetLeavesTheStop(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(200*time.Millisecond))
+	defer cancel()
+	if closeBudgetLeft(ctx, 700*time.Millisecond) {
+		t.Fatal("short deadline must not cancel the stop")
+	}
+	if !closeBudgetLeft(context.Background(), 700*time.Millisecond) {
+		t.Fatal("no deadline has room to close")
 	}
 }
 

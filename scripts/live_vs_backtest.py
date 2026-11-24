@@ -44,7 +44,8 @@ THRESHOLD = 0.65
 KILL_GAP_BPS = 1.5
 EDGE_BPS = 1.72
 DEFAULT_RESEARCH = Path(r"C:\All\Develop\new-algotrading-adventure")
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+# api.binance.com answers 451 from some networks. The vision mirror serves the same klines.
+BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines"
 
 
 @dataclass
@@ -110,11 +111,7 @@ def parse_paste(text: str) -> list[Row]:
         live = parse_num(parts[12]) if len(parts) > 12 else None
         shadow = parse_num(parts[13]) if len(parts) > 13 else None
         # Windows tab inserts a skip column, so index 12 is not ret bps there.
-        if side != 0 and live is None:
-            side_for_row = side
-            live_bps = None
-            shadow_bps = None
-        elif side != 0 and live is not None:
+        if side != 0:
             side_for_row = side
             live_bps = live
             shadow_bps = shadow
@@ -244,10 +241,11 @@ def _fmt(value: float | None, width: int = 7, digits: int = 2) -> str:
 
 def report(rows: list[Row], bars: dict[int, tuple[float, float, float]], threshold: float) -> int:
     paired: list[tuple[Row, bool, float]] = []
+    unsettled: list[tuple[Row, bool, float]] = []
     skipped: list[tuple[Row, int, bool, float]] = []
     missing: list[str] = []
     for row in rows:
-        if row.entered:
+        if row.side != 0:
             side = row.side
         else:
             side = gate_side(row.p_up, threshold)
@@ -263,6 +261,8 @@ def report(rows: list[Row], bars: dict[int, tuple[float, float, float]], thresho
             if gated != 0 and gated != row.side:
                 print(f"{row.iso}  live side {row.side} != gate side {gated} from p_up {row.p_up:.3f}")
             paired.append((row, hit, ret))
+        elif row.side != 0:
+            unsettled.append((row, hit, ret))
         else:
             skipped.append((row, side, hit, ret))
 
@@ -307,6 +307,12 @@ def report(rows: list[Row], bars: dict[int, tuple[float, float, float]], thresho
             f"gap {sum(gap)/len(gap):.2f} bps vs kill line {KILL_GAP_BPS:.1f} bps "
             f"and edge {EDGE_BPS:.2f} bps (startpack §12–§13)"
         )
+    if unsettled:
+        print(f"entered without ret bps, excluded from the mean: {len(unsettled)}")
+        for row, hit, ret in unsettled:
+            name = "LONG" if row.side == 1 else "SHORT"
+            how = "stop" if hit else "close"
+            print(f"  {row.iso}  {name}  p_up={row.p_up:.3f}  {how} {ret:+.2f}  shadow={_fmt(row.shadow_bps, 6, 1).strip()}")
     if skipped:
         print(f"gated skips excluded from the mean: {len(skipped)}")
         for row, side, hit, ret in skipped:
@@ -361,7 +367,7 @@ def main() -> int:
     if args.paste is None:
         parser.error("paste file is required")
     rows = parse_paste(args.paste.read_text(encoding="utf-8"))
-    needed = [r for r in rows if r.entered or gate_side(r.p_up, args.threshold) != 0]
+    needed = [r for r in rows if r.side != 0 or gate_side(r.p_up, args.threshold) != 0]
     if not needed:
         print("paste has no entered trade and no quote at the threshold")
         return 1

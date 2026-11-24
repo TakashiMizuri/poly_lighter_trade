@@ -75,6 +75,14 @@ func main() {
 		httpClient.SetTokenSource(func(context.Context) (string, error) {
 			return signer.AuthToken()
 		})
+		if !cfg.DryRun && cfg.WSURL != "" {
+			meta := markets[cfg.Symbol]
+			hub := lighter.NewStream(cfg.WSURL, cfg.AccountIndex, meta.MarketID, signer.AuthToken, log)
+			signer.Stream = hub
+			httpClient.Stream = hub
+			go hub.Run(ctx)
+			log.Info("lighter stream", "url", cfg.WSURL, "market_id", meta.MarketID)
+		}
 	} else {
 		log.Warn("running without signer (DRY_RUN)")
 	}

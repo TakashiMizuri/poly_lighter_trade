@@ -17,13 +17,13 @@ import (
 )
 
 type Bot struct {
-	Token   string
-	Allowed map[int64]bool
-	Engine  *engine.Engine
-	Log     *slog.Logger
-	HTTP    *http.Client
-	offset  int
-	mu      sync.Mutex
+	Token    string
+	Allowed  map[int64]bool
+	Engine   *engine.Engine
+	Log      *slog.Logger
+	HTTP     *http.Client
+	offset   int
+	mu       sync.Mutex
 	lastSend time.Time
 	hbEvery  time.Duration
 	alertAt  map[string]time.Time
@@ -82,7 +82,7 @@ func (b *Bot) Run(ctx context.Context) {
 			return
 		}
 		if err := b.poll(ctx); err != nil && ctx.Err() == nil {
-			b.Log.Warn("telegram poll", "err", err)
+			b.Log.Warn("telegram poll", "err", b.redact(err))
 			time.Sleep(3 * time.Second)
 		}
 	}
@@ -111,9 +111,9 @@ func (b *Bot) heartbeat(ctx context.Context) {
 }
 
 type tgResp struct {
-	OK   bool            `json:"ok"`
+	OK     bool            `json:"ok"`
 	Result json.RawMessage `json:"result"`
-	Desc string          `json:"description"`
+	Desc   string          `json:"description"`
 }
 
 type update struct {
@@ -129,6 +129,17 @@ type update struct {
 	} `json:"message"`
 }
 
+func (b *Bot) redact(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if b != nil && b.Token != "" {
+		s = strings.ReplaceAll(s, b.Token, "[redacted]")
+	}
+	return s
+}
+
 func (b *Bot) poll(ctx context.Context) error {
 	u := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?timeout=25&offset=%d", b.Token, b.offset)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -137,7 +148,7 @@ func (b *Bot) poll(ctx context.Context) error {
 	}
 	resp, err := b.HTTP.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s", b.redact(err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)

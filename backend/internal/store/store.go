@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -753,17 +754,21 @@ WHERE lighter_entry_px IS NOT NULL AND ret_bps IS NOT NULL AND shadow_ret_bps IS
 	if livePaired.Valid && shadowPaired.Valid {
 		st.GapBps, st.MatchCoef = LiveShadowGap(pairedLiveMean, shadowPaired.Float64)
 	}
-	// fill_lag_ms <= 0 is a whole-second created_at collapsed onto :00, not a measured lag.
-	const tradeLag = `side IN ('long','short') AND lighter_entry_px IS NOT NULL AND fill_lag_ms IS NOT NULL AND fill_lag_ms > 0`
-	st.P50LagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.50)
-	st.P90LagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.90)
-	var meanLag sql.NullFloat64
-	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(1), AVG(fill_lag_ms) FROM windows WHERE `+tradeLag).Scan(&st.NFillLag, &meanLag)
-	if meanLag.Valid {
-		st.MeanFillLagMS = meanLag.Float64
+	// Headline lag is our sendTx ack (ms_open_to_send_ack). A precise exchange
+	// created_at counts only when the ack was not stored. Whole seconds do not.
+	lags := s.entryAckLags(ctx)
+	st.NFillLag = len(lags)
+	if st.NFillLag > 0 {
+		sum := 0.0
+		for _, v := range lags {
+			sum += v
+		}
+		st.MeanFillLagMS = sum / float64(st.NFillLag)
+		st.P50LagMS = lagPercentile(lags, 0.50)
+		st.P90LagMS = lagPercentile(lags, 0.90)
+		st.P50FillLagMS = st.P50LagMS
+		st.P90FillLagMS = st.P90LagMS
 	}
-	st.P50FillLagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.50)
-	st.P90FillLagMS = percentileWhere(s, ctx, "fill_lag_ms", tradeLag, 0.90)
 
 	var sampleFrom, sampleTo sql.NullInt64
 	_ = s.DB.QueryRowContext(ctx, `SELECT MIN(window_ts), MAX(window_ts) FROM windows`).Scan(&sampleFrom, &sampleTo)
@@ -784,6 +789,51 @@ SELECT equity_after FROM windows WHERE equity_after IS NOT NULL ORDER BY window_
 	st.Forecast = BuildForecast(equity, st.NTrades, st.NWindows, wins, st.MeanBps, st.MeanPnLUSD, fromTS, toTS)
 	st.Forecast.WR = st.WR
 	return st, nil
+}
+
+func (s *Store) entryAckLags(ctx context.Context) []float64 {
+	rows, err := s.DB.QueryContext(ctx, `
+SELECT IFNULL(timings,''), fill_lag_ms
+FROM windows
+WHERE side IN ('long','short') AND lighter_entry_px IS NOT NULL`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []float64
+	for rows.Next() {
+		var raw string
+		var fill sql.NullFloat64
+		if err := rows.Scan(&raw, &fill); err != nil {
+			continue
+		}
+		ack := 0.0
+		if t := parseTimings(raw); t != nil && t.MsOpenToSendAck > 0 {
+			ack = t.MsOpenToSendAck
+		} else if fill.Valid && fill.Float64 > 0 {
+			ack = fill.Float64
+		}
+		if ack > 0 {
+			out = append(out, ack)
+		}
+	}
+	return out
+}
+
+func lagPercentile(vals []float64, p float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), vals...)
+	sort.Float64s(sorted)
+	off := int(float64(len(sorted)-1) * p)
+	if off < 0 {
+		off = 0
+	}
+	if off >= len(sorted) {
+		off = len(sorted) - 1
+	}
+	return sorted[off]
 }
 
 func percentile(s *Store, ctx context.Context, col string, p float64) float64 {

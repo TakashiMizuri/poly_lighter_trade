@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,6 +22,7 @@ type HTTPClient struct {
 	Log         *slog.Logger
 	mu          sync.Mutex
 	tokenFn     func(context.Context) (string, error)
+	Stream      *Stream
 	minInterval time.Duration
 	lastReq     time.Time
 	rateMu      sync.Mutex
@@ -34,11 +34,8 @@ func NewHTTP(baseURL string) *HTTPClient {
 		HTTP: &http.Client{
 			Timeout: 4 * time.Second,
 			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   800 * time.Millisecond,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
+				Proxy:               http.ProxyFromEnvironment,
+				DialContext:         DialContext,
 				MaxIdleConns:        32,
 				MaxIdleConnsPerHost: 16,
 				IdleConnTimeout:     90 * time.Second,
@@ -127,7 +124,18 @@ func (c *HTTPClient) doGET(ctx context.Context, path string, q url.Values, auth,
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
 			c.audit("http get", "path", path, "attempt", attempt, "ms", time.Since(started).Milliseconds(), "err", err.Error())
-			return nil, err
+			// Paced reads retry a short DNS/dial blip. Urgent calls and sendTx do not.
+			if !paced || attempt >= 2 || ctx.Err() != nil {
+				return nil, err
+			}
+			t := time.NewTimer(80 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return nil, ctx.Err()
+			case <-t.C:
+			}
+			continue
 		}
 		b, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -300,6 +308,11 @@ func (c *HTTPClient) ResolveMarkets(ctx context.Context, symbols []string) (map[
 }
 
 func (c *HTTPClient) LastPrice(ctx context.Context, symbol string) (float64, error) {
+	if c != nil && c.Stream != nil {
+		if px, ok := c.Stream.FreshPrice(streamPriceMaxAge); ok {
+			return px, nil
+		}
+	}
 	all, err := c.Markets(ctx)
 	if err != nil {
 		return 0, err

@@ -56,10 +56,25 @@ function isTrade(w: WindowRow) {
   return w.side === "long" || w.side === "short";
 }
 
-/** Лаг только у входов: open 5m UTC → биржевой created_at ордера Lighter. */
+/** Лаг входа: ответ sendTx минус :00. Биржевой created_at — только если он с долями секунды и своего ack нет. */
 function tradeLag(w: WindowRow): number | null {
   if (!isTrade(w) || num(w.lighter_entry_px) == null) return null;
-  return num(w.fill_lag_ms);
+  const ack = w.timings?.ms_open_to_send_ack;
+  if (ack != null && ack > 0) return ack;
+  const exch = num(w.fill_lag_ms);
+  if (exch != null && exch > 0) return exch;
+  return null;
+}
+
+function lagText(w: WindowRow): string {
+  const ack = tradeLag(w);
+  if (ack == null) return "—";
+  const exch = num(w.fill_lag_ms);
+  const own = w.timings?.ms_open_to_send_ack;
+  if (own != null && own > 0 && exch != null && exch > 0 && Math.abs(exch - own) > 1) {
+    return `${ms(own)} · биржа ${ms(exch)}`;
+  }
+  return ms(ack);
 }
 
 function sideBadge(side: string) {
@@ -164,7 +179,7 @@ function EquityChart({ points }: { points: EquityPoint[] }) {
 function LagChart({ series }: { series: { ts: number; lag: number }[] }) {
   return (
     <section>
-      <div className="mb-2 text-[11px] text-muted-foreground">Лаг входов, мс</div>
+      <div className="mb-2 text-[11px] text-muted-foreground">Лаг входа, ответ sendTx, мс</div>
       {series.length < 2 ? (
         <p className="text-sm text-muted-foreground">Нужны две сделки с временем ордера</p>
       ) : (
@@ -361,7 +376,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                 </div>
               </div>
               <div>
-                <div className="text-[11px] text-muted-foreground">Лаг входа</div>
+                <div className="text-[11px] text-muted-foreground">Лаг sendTx</div>
                 <div className="mt-1 text-base font-medium tabular-nums">{stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"}</div>
                 <div className="mt-0.5 text-xs text-muted-foreground">
                   p50 {stats?.n_fill_lag ? ms(stats.p50_fill_lag_ms) : "—"} · p90 {stats?.n_fill_lag ? ms(stats.p90_fill_lag_ms) : "—"} · n {stats?.n_fill_lag ?? 0}
@@ -440,7 +455,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
           </TabsContent>
 
           <TabsContent value="trades" className="space-y-3 p-4">
-            <p className="text-xs text-muted-foreground">Лаг — created_at ордера на Lighter минус :00.</p>
+            <p className="text-xs text-muted-foreground">Лаг — ответ sendTx минус :00. Биржевой created_at пишется рядом, когда у него есть миллисекунды.</p>
             <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-4">
               <Metric label="Средний лаг" value={stats?.n_fill_lag ? ms(stats.mean_fill_lag_ms) : "—"} />
               <Metric label="p50 / p90" value={lagPair(stats?.n_fill_lag, stats?.p50_fill_lag_ms, stats?.p90_fill_lag_ms)} />
@@ -616,7 +631,7 @@ function WindowTable({ rows, tradesOnly, threshold = 0.65 }: { rows: WindowRow[]
                 <MiniMetric label="PM Up" value={fmt(w.p_up, 3)} />
                 <MiniMetric label="Спред" value={fmt(w.spread, 3)} />
                 {!tradesOnly ? <MiniMetric label="Источник" value={w.quote_source || "—"} /> : null}
-                <MiniMetric label="Лаг :00 → ордер" value={ms(tradeLag(w))} />
+                <MiniMetric label="Лаг :00 → ответ" value={lagText(w)} />
                 <MiniMetric label="Lighter in" value={fmt(num(w.lighter_entry_px), 1)} />
                 <MiniMetric label="Lighter out" value={fmt(num(w.lighter_exit_px), 1)} />
                 <MiniMetric label="Стоп" value={fmt(num(w.stop_px), 1)} />
@@ -644,7 +659,7 @@ function WindowTable({ rows, tradesOnly, threshold = 0.65 }: { rows: WindowRow[]
             <TableHead>спред</TableHead>
             <TableHead>котировка</TableHead>
             {!tradesOnly ? <TableHead>skip</TableHead> : null}
-            <TableHead>лаг :00→ордер</TableHead>
+            <TableHead>лаг :00→ответ</TableHead>
             <TableHead>таймлайн, мс</TableHead>
             <TableHead>Lighter in</TableHead>
             <TableHead>Lighter out</TableHead>
@@ -665,7 +680,7 @@ function WindowTable({ rows, tradesOnly, threshold = 0.65 }: { rows: WindowRow[]
               <TableCell>{fmt(w.spread, 3)}</TableCell>
               <TableCell className="text-xs">{w.quote_source || "—"}</TableCell>
               {!tradesOnly ? <TableCell className="text-xs">{w.skip_reason ? skipLabel(w.skip_reason, threshold) : "—"}</TableCell> : null}
-              <TableCell>{ms(tradeLag(w))}</TableCell>
+              <TableCell className="whitespace-nowrap text-xs">{lagText(w)}</TableCell>
               <TableCell className="max-w-[40rem] min-w-[22rem] whitespace-normal">
                 <TimingsView t={w.timings} compact />
               </TableCell>

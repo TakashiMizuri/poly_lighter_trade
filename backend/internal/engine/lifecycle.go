@@ -66,6 +66,7 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 }
 
 func (e *Engine) Run(ctx context.Context) {
+	go e.repairExitsLoop(ctx)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -80,7 +81,43 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
+func (e *Engine) repairExitsLoop(ctx context.Context) {
+	t := time.NewTicker(20 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			c, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			e.repairUnconfirmedExits(c)
+			cancel()
+		}
+	}
+}
+
+func (e *Engine) retryNakedFlatten(ctx context.Context) {
+	e.mu.Lock()
+	need := e.needsFlatten
+	last := e.flattenTry
+	e.mu.Unlock()
+	if !need || time.Since(last) < 2*time.Second {
+		return
+	}
+	e.mu.Lock()
+	e.flattenTry = time.Now()
+	e.mu.Unlock()
+	if err := e.ensureFlat(ctx, "settle"); err != nil {
+		e.Log.Warn("settle flatten", "err", err)
+		return
+	}
+	e.mu.Lock()
+	e.needsFlatten = false
+	e.mu.Unlock()
+}
+
 func (e *Engine) tick(ctx context.Context) error {
+	e.retryNakedFlatten(ctx)
 	if e.isHalted() {
 		e.setState(StateHalt)
 		_ = e.ensureFlat(ctx, "halt")

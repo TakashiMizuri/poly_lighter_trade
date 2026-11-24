@@ -63,6 +63,9 @@ func TestIsAmbiguousSubmit(t *testing.T) {
 		{"http status", fmt.Errorf("POST /api/v1/sendTx: HTTP 503: unavailable"), false},
 		{"sign", fmt.Errorf("qty scales to 0"), false},
 		{"plain", errors.New("nope"), false},
+		{"not submitted deadline", fmt.Errorf("%w: %v", ErrNotSubmitted, context.DeadlineExceeded), false},
+		{"stream down", ErrStreamDown, false},
+		{"ack lost", fmt.Errorf("%w: %v", ErrAckLost, context.DeadlineExceeded), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

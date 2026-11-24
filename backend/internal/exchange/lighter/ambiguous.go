@@ -17,6 +17,9 @@ func IsPreConnectFail(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrNotSubmitted) || errors.Is(err, ErrStreamDown) {
+		return true
+	}
 	var dns *net.DNSError
 	if errors.As(err, &dns) {
 		return true
@@ -50,6 +53,9 @@ func IsPreConnectFail(err error) bool {
 func IsAmbiguousSubmit(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, ErrAckLost) {
+		return true
 	}
 	if IsPreConnectFail(err) {
 		return false
