@@ -76,13 +76,18 @@ func (c *HTTPClient) accountTrades(ctx context.Context, accountIndex int64, mark
 }
 
 func takerFeeUSD(m map[string]any) float64 {
-	fee := floatField(m, "taker_fee")
-	if fee <= 0 {
-		return 0
-	}
 	notional := floatField(m, "usd_amount")
 	if notional <= 0 {
 		notional = floatField(m, "price") * floatField(m, "size")
+	}
+	return quoteFeeUSD(floatField(m, "taker_fee"), notional)
+}
+
+// quoteFeeUSD converts a Lighter fee field to USD. Integer fees at or below
+// 10_000 are millionths of notional; larger integers may be micro-USD.
+func quoteFeeUSD(fee, notional float64) float64 {
+	if fee <= 0 {
+		return 0
 	}
 	const maxPPM = 10000
 	if fee == float64(int64(fee)) && fee <= maxPPM && notional > 0 {
@@ -97,6 +102,15 @@ func takerFeeUSD(m map[string]any) float64 {
 		return fee
 	}
 	return 0
+}
+
+// sideFeeUSD picks maker or taker fee for one side of a trade.
+// The ask is the maker when isMakerAsk is set.
+func sideFeeUSD(isAsk, isMakerAsk bool, takerFee, makerFee, notional float64) float64 {
+	if isAsk == isMakerAsk {
+		return quoteFeeUSD(makerFee, notional)
+	}
+	return quoteFeeUSD(takerFee, notional)
 }
 
 func FillsForClient(fills []Fill, clientIdx int64) []Fill {

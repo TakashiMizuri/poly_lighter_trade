@@ -1,6 +1,7 @@
 package lighter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,10 +55,15 @@ type Stream struct {
 }
 
 type fillAcc struct {
-	quote     float64
-	qty       float64
-	fee       float64
-	fromOrder bool
+	tradeQuote float64
+	tradeQty   float64
+	tradeFee   float64
+	trades     map[string]struct{}
+	orderQuote float64
+	orderQty   float64
+	status     string
+	terminal   bool
+	touched    time.Time
 }
 
 type streamSend struct {
@@ -97,18 +104,39 @@ func (s *Stream) FreshPrice(maxAge time.Duration) (float64, bool) {
 	return s.price, true
 }
 
-// Fill returns the accumulated trade for a client order index, if any print has arrived.
+// Fill returns the current size for a client order index, including a partial.
 func (s *Stream) Fill(clientIdx int64) (px, qty, fee float64, ok bool) {
+	px, qty, fee, _, ok = s.FillState(clientIdx)
+	return
+}
+
+// FillState returns the accumulated fill and whether the order is terminal
+// (filled or canceled). Trades are deduped by trade id. An order snapshot
+// contributes size only when it is ahead of the tape.
+func (s *Stream) FillState(clientIdx int64) (px, qty, fee float64, terminal, ok bool) {
 	if s == nil || clientIdx == 0 {
-		return 0, 0, 0, false
+		return 0, 0, 0, false, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	f := s.fills[clientIdx]
-	if f == nil || f.qty <= 0 {
-		return 0, 0, 0, false
+	if f == nil {
+		return 0, 0, 0, false, false
 	}
-	return f.quote / f.qty, f.qty, f.fee, true
+	return f.view()
+}
+
+func (f *fillAcc) view() (px, qty, fee float64, terminal, ok bool) {
+	terminal = f.terminal
+	tradesCover := f.orderQty <= 0 || f.tradeQty+1e-12 >= f.orderQty
+	switch {
+	case f.tradeQty > 0 && tradesCover:
+		return f.tradeQuote / f.tradeQty, f.tradeQty, f.tradeFee, terminal, true
+	case f.orderQty > 0 && f.orderQuote > 0:
+		return f.orderQuote / f.orderQty, f.orderQty, 0, terminal, true
+	default:
+		return 0, 0, 0, terminal, false
+	}
 }
 
 // SendTx writes jsonapi/sendtx on the open socket and waits for the matching id.
@@ -143,11 +171,22 @@ func (s *Stream) SendTx(ctx context.Context, txType int, txInfo string) (*SendTx
 		},
 	}
 	s.writeMu.Lock()
-	err := conn.WriteJSON(body)
-	s.writeMu.Unlock()
-	if err != nil {
-		return nil, ErrStreamDown
+	if err := ctx.Err(); err != nil {
+		s.writeMu.Unlock()
+		return nil, fmt.Errorf("%w: %v", ErrNotSubmitted, err)
 	}
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetWriteDeadline(dl)
+	}
+	err := conn.WriteJSON(body)
+	if err != nil {
+		_ = conn.Close()
+		_ = conn.SetWriteDeadline(time.Time{})
+		s.writeMu.Unlock()
+		return nil, fmt.Errorf("%w: %v", ErrAckLost, err)
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+	s.writeMu.Unlock()
 	select {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("%w: %v", ErrAckLost, ctx.Err())
@@ -212,6 +251,8 @@ func (s *Stream) serve(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
+	// Fills stay across reconnects. The account_all_trades subscribe ack is an empty
+	// snapshot; trade-id dedup absorbs a replay, and wiping here would drop an in-flight fill.
 	s.mu.Lock()
 	s.conn = conn
 	s.connected = true
@@ -341,10 +382,17 @@ func (s *Stream) handle(data []byte) {
 	if msg.Type == "pong" || msg.Type == "connected" {
 		return
 	}
-	if msg.Error != nil && (msg.ID != "" || msg.Type == "jsonapi/sendtx") {
+	if msg.Error != nil && msg.Type != "jsonapi/sendtx" && msg.TxHash == "" && msg.Code == 0 && msg.ID != "" {
 		s.deliver(msg.ID, nil, fmt.Errorf("sendTx code=%d msg=%s", msg.Error.Code, msg.Error.Message))
-	}
-	if msg.Type == "jsonapi/sendtx" || msg.TxHash != "" || msg.Code != 0 {
+	} else if msg.Type == "jsonapi/sendtx" || msg.TxHash != "" || msg.Code != 0 {
+		if msg.Error != nil {
+			if msg.Code == 0 {
+				msg.Code = msg.Error.Code
+			}
+			if msg.Message == "" {
+				msg.Message = msg.Error.Message
+			}
+		}
 		s.deliverSend(msg)
 	}
 	s.ingestPrice(msg.MarketStats)
@@ -467,16 +515,22 @@ func (s *Stream) ingestOrders(raw json.RawMessage) {
 	}
 	for _, orders := range byMarket {
 		for _, o := range orders {
-			idx := o.ClientIdx
+			idx := int64(o.ClientIdx)
 			if idx == 0 {
 				idx = parseFlexInt(o.ClientID)
 			}
-			base := parseFlex(o.FilledBase)
-			quote := parseFlex(o.FilledQuote)
-			if idx == 0 || base <= 0 || quote <= 0 {
+			base := parseFlex(string(o.FilledBase))
+			quote := parseFlex(string(o.FilledQuote))
+			if idx == 0 {
 				continue
 			}
-			s.addFill(idx, quote/base, base, 0, true)
+			if base <= 0 || quote <= 0 {
+				if orderTerminal(o.Status) {
+					s.noteOrder(idx, 0, 0, o.Status)
+				}
+				continue
+			}
+			s.noteOrder(idx, quote/base, base, o.Status)
 		}
 	}
 }
@@ -501,74 +555,195 @@ func (s *Stream) ingestTrades(raw json.RawMessage) {
 
 func (s *Stream) addTrades(trades []streamTrade) {
 	for _, t := range trades {
-		px := parseFlex(t.Price)
-		qty := parseFlex(t.Size)
+		px := float64(t.Price)
+		qty := float64(t.Size)
 		if px <= 0 || qty <= 0 {
 			continue
 		}
-		fee := parseFlex(t.TakerFee)
-		if t.AskAccount == s.AccountIndex && t.AskClient != 0 {
-			s.addFill(t.AskClient, px, qty, fee, false)
+		notional := float64(t.USD)
+		if notional <= 0 {
+			notional = px * qty
 		}
-		if t.BidAccount == s.AccountIndex && t.BidClient != 0 && t.BidClient != t.AskClient {
-			s.addFill(t.BidClient, px, qty, fee, false)
+		id := t.dedupID()
+		if int64(t.AskAccount) == s.AccountIndex && int64(t.AskClient) != 0 {
+			fee := sideFeeUSD(true, t.IsMakerAsk, float64(t.TakerFee), float64(t.MakerFee), notional)
+			s.addTrade(int64(t.AskClient), id, px, qty, fee)
+		}
+		if int64(t.BidAccount) == s.AccountIndex && int64(t.BidClient) != 0 && t.BidClient != t.AskClient {
+			fee := sideFeeUSD(false, t.IsMakerAsk, float64(t.TakerFee), float64(t.MakerFee), notional)
+			s.addTrade(int64(t.BidClient), id, px, qty, fee)
 		}
 	}
 }
 
-func (s *Stream) addFill(idx int64, px, qty, fee float64, fromOrder bool) {
+func (s *Stream) addTrade(idx int64, tradeID string, px, qty, fee float64) {
 	if idx == 0 || qty <= 0 || px <= 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.fills[idx]
-	if f == nil {
-		if len(s.fills) >= streamFillCap {
-			for k := range s.fills {
-				delete(s.fills, k)
-				break
-			}
-		}
-		f = &fillAcc{}
-		s.fills[idx] = f
-	}
-	if fromOrder {
-		if f.qty > 0 && !f.fromOrder {
+	f := s.ensureLocked(idx)
+	if tradeID != "" {
+		if _, ok := f.trades[tradeID]; ok {
+			f.touched = time.Now()
 			return
 		}
-		f.quote = px * qty
-		f.qty = qty
-		f.fromOrder = true
-		if fee > 0 {
-			f.fee = fee
-		}
+		f.trades[tradeID] = struct{}{}
+	}
+	f.tradeQuote += px * qty
+	f.tradeQty += qty
+	f.tradeFee += fee
+	f.touched = time.Now()
+}
+
+func (s *Stream) noteOrder(idx int64, px, qty float64, status string) {
+	if idx == 0 {
 		return
 	}
-	if f.fromOrder {
-		f.quote, f.qty, f.fee = 0, 0, 0
-		f.fromOrder = false
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.ensureLocked(idx)
+	term := orderTerminal(status)
+	if qty > 0 && px > 0 && (qty+1e-12 >= f.orderQty || !f.terminal) {
+		f.orderQty = qty
+		f.orderQuote = px * qty
 	}
-	f.quote += px * qty
-	f.qty += qty
-	f.fee += fee
+	if status != "" && (term || !f.terminal) {
+		f.status = status
+		f.terminal = term
+	}
+	f.touched = time.Now()
+}
+
+func (s *Stream) ensureLocked(idx int64) *fillAcc {
+	if s.fills == nil {
+		s.fills = map[int64]*fillAcc{}
+	}
+	if f := s.fills[idx]; f != nil {
+		return f
+	}
+	if len(s.fills) >= streamFillCap {
+		var oldK int64
+		var oldAt time.Time
+		first := true
+		for k, v := range s.fills {
+			if first || v.touched.Before(oldAt) {
+				first = false
+				oldK, oldAt = k, v.touched
+			}
+		}
+		if !first {
+			delete(s.fills, oldK)
+		}
+	}
+	f := &fillAcc{trades: map[string]struct{}{}}
+	s.fills[idx] = f
+	return f
+}
+
+func orderTerminal(status string) bool {
+	switch status {
+	case "filled", "canceled":
+		return true
+	default:
+		return strings.HasPrefix(status, "canceled-")
+	}
 }
 
 type streamOrder struct {
-	ClientIdx   int64  `json:"client_order_index"`
-	ClientID    string `json:"client_order_id"`
-	FilledBase  string `json:"filled_base_amount"`
-	FilledQuote string `json:"filled_quote_amount"`
+	ClientIdx   flexInt  `json:"client_order_index"`
+	ClientID    string   `json:"client_order_id"`
+	FilledBase  flexText `json:"filled_base_amount"`
+	FilledQuote flexText `json:"filled_quote_amount"`
+	Status      string   `json:"status"`
 }
 
 type streamTrade struct {
-	Price      string `json:"price"`
-	Size       string `json:"size"`
-	AskClient  int64  `json:"ask_client_id"`
-	BidClient  int64  `json:"bid_client_id"`
-	AskAccount int64  `json:"ask_account_id"`
-	BidAccount int64  `json:"bid_account_id"`
-	TakerFee   string `json:"taker_fee"`
+	TradeID    flexText  `json:"trade_id"`
+	TradeIDStr string    `json:"trade_id_str"`
+	Price      flexFloat `json:"price"`
+	Size       flexFloat `json:"size"`
+	USD        flexFloat `json:"usd_amount"`
+	AskClient  flexInt   `json:"ask_client_id"`
+	BidClient  flexInt   `json:"bid_client_id"`
+	AskAccount flexInt   `json:"ask_account_id"`
+	BidAccount flexInt   `json:"bid_account_id"`
+	IsMakerAsk bool      `json:"is_maker_ask"`
+	TakerFee   flexFloat `json:"taker_fee"`
+	MakerFee   flexFloat `json:"maker_fee"`
+}
+
+func (t streamTrade) dedupID() string {
+	if id := strings.TrimSpace(t.TradeIDStr); id != "" {
+		return id
+	}
+	id := strings.TrimSpace(string(t.TradeID))
+	if id == "" || id == "0" {
+		return ""
+	}
+	return id
+}
+
+type flexFloat float64
+
+func (f *flexFloat) UnmarshalJSON(b []byte) error {
+	*f = 0
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || string(b) == "null" {
+		return nil
+	}
+	if b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		if s == "" {
+			return nil
+		}
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return err
+		}
+		*f = flexFloat(v)
+		return nil
+	}
+	v, err := strconv.ParseFloat(string(b), 64)
+	if err != nil {
+		return err
+	}
+	*f = flexFloat(v)
+	return nil
+}
+
+type flexInt int64
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	var n flexFloat
+	if err := n.UnmarshalJSON(b); err != nil {
+		return err
+	}
+	*f = flexInt(n)
+	return nil
+}
+
+type flexText string
+
+func (f *flexText) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || string(b) == "null" {
+		*f = ""
+		return nil
+	}
+	if b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*f = flexText(s)
+		return nil
+	}
+	*f = flexText(b)
+	return nil
 }
 
 func parseFlex(s string) float64 {

@@ -450,6 +450,7 @@ func (e *Engine) sendMarketClose(ctx context.Context, pos *livePos, fillWait tim
 		Symbol:       e.Cfg.Symbol,
 		ClientIdx:    idx,
 		TxHash:       txHash,
+		WantQty:      pos.Qty,
 		FallbackPx:   ref,
 		SizeDecimals: meta.SizeDecimals,
 		Budget:       confirmBudget,
@@ -653,7 +654,11 @@ func (e *Engine) pendingFillBooked(ctx context.Context) bool {
 	}
 	px, qty, fee, ok := 0.0, 0.0, 0.0, false
 	if e.HTTP.Stream != nil {
-		px, qty, fee, ok = e.HTTP.Stream.Fill(p.ClientIdx)
+		var terminal bool
+		px, qty, fee, terminal, ok = e.HTTP.Stream.FillState(p.ClientIdx)
+		if !terminal {
+			ok = false
+		}
 	}
 	if !ok || qty <= 0 || px <= 0 {
 		meta, mok := e.Markets[e.Cfg.Symbol]

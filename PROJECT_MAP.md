@@ -3,7 +3,7 @@
 Краткая навигация для ИИ и людей. Детали стратегии — в `docs/`, деплой — в `INSTRUCTIONS.md`.  
 **Обновляй эту карту**, когда меняется структура, ответственность пакетов или критичные потоки.
 
-Последняя актуализация: 2026-11-24 (Lighter stream: sendtx, филлы, last; лаг дашборда — ack sendTx).
+Последняя актуализация: 2026-11-24 (stream: ошибка записи кадра — ambiguous; филл финален по статусу или полному объёму; трейды дедупятся).
 
 ---
 
@@ -76,7 +76,7 @@ main.go
        → hold → exit starts 1500ms before the boundary / detect remote close / flatten
        → settle: one reduce; on the boundary, no pre-close tape and cancel+IOC deadline leaves T+2 for decide; the exit order row is written on its own short context; exit px/PnL only from the tape (refine async)
        → decide refreshes a stale equity/price snapshot once inside the entry budget; the dashboard lag is the local sendTx ack, and a sub-second exchange created_at is stored beside it
-       → Lighter stream (wss …/stream) sends jsonapi/sendtx and pushes fills + last; REST is the fallback when the socket is down. Ping every 60s, reconnect on drop
+       → Lighter stream (wss …/stream) sends jsonapi/sendtx and pushes fills + last; REST is the fallback when the socket is down. A write error after the attempt is ambiguous and is not retried with a new nonce. A stream fill is final when the order is terminal or size has reached the request; trades are deduped by trade id. Ping every 60s, reconnect on drop
        → a boundary close does not cancel the stop unless the IOC still fits; an unbooked exit is repaired on a timer onto the original window
        → shadow binance (shadow columns only)
   ↔ api.Server (dashboard, kill/resume, status)
